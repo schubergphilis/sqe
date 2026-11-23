@@ -84,6 +84,9 @@ pub(crate) fn sqe_error_to_status(
         sqe_core::SqeErrorCode::QueryTimeout => tonic::Code::DeadlineExceeded,
         sqe_core::SqeErrorCode::QueryCancelled => tonic::Code::Cancelled,
         sqe_core::SqeErrorCode::ResourceExhausted => tonic::Code::ResourceExhausted,
+        // The statement's own cap, not load: ResourceExhausted is the code
+        // clients retry with backoff, and this statement fails again (#933).
+        sqe_core::SqeErrorCode::ExceededQueryMemoryLimit => tonic::Code::FailedPrecondition,
 
         // Transient catalog/storage failures (issue #12): map to gRPC
         // codes that clients and operators recognise as retryable. Without

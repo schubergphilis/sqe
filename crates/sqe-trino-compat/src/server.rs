@@ -4954,6 +4954,96 @@ mod tests {
         );
     }
 
+    /// Executor that fails at once with a fixed code and message.
+    struct FailingWith(sqe_core::SqeErrorCode, &'static str);
+    #[async_trait::async_trait]
+    impl TrinoQueryExecutor for FailingWith {
+        async fn execute(
+            &self,
+            _: &Session,
+            _: &str,
+        ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+            Err(sqe_core::SqeError::with_code(self.0, self.1))
+        }
+    }
+
+    /// Submit `SELECT 1` against an executor that fails with `code` and
+    /// return the response parts a client sees.
+    async fn failed_submit(
+        code: sqe_core::SqeErrorCode,
+        message: &'static str,
+    ) -> (StatusCode, Option<String>, protocol::TrinoResponse) {
+        let state = state_with(Arc::new(MockAuthOk), Arc::new(FailingWith(code, message)));
+        let resp = submit_query::<MockAuthOk, FailingWith>(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "SELECT 1".to_string(),
+        )
+        .await
+        .into_response();
+        let status = resp.status();
+        let retry = retry_after(&resp);
+        (status, retry, body_json(resp).await)
+    }
+
+    /// #933: a statement over `query.max_query_memory` ends FAILED with its
+    /// own name, HTTP 200 and no `Retry-After`; a load refusal keeps
+    /// `RESOURCE_EXHAUSTED` and its `Retry-After`. SQE answers a failed
+    /// statement with HTTP 200 (the failure is in the body), never 429.
+    #[tokio::test]
+    async fn exceeded_query_memory_limit_is_not_retried_as_load() {
+        let (status, retry, tr) = failed_submit(
+            sqe_core::SqeErrorCode::ExceededQueryMemoryLimit,
+            "Query execution failed: query.max_query_memory=1048576 bytes exceeded",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(retry, None, "the statement's own limit is not a retry");
+        assert_eq!(tr.stats.state, "FAILED");
+        let error = tr.error.expect("failed statement carries an error");
+        assert_eq!(error.error_name, "EXCEEDED_QUERY_MEMORY_LIMIT");
+        assert_eq!(error.error_type, "INSUFFICIENT_RESOURCES");
+        assert!(
+            error.message.contains("query.max_query_memory"),
+            "{}",
+            error.message
+        );
+
+        let (status, retry, tr) = failed_submit(
+            sqe_core::SqeErrorCode::ResourceExhausted,
+            "Resources exhausted: the pool is full of other statements",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(retry.as_deref(), Some("1"));
+        let error = tr.error.expect("failed statement carries an error");
+        assert_eq!(error.error_name, "RESOURCE_EXHAUSTED");
+        assert_eq!(error.error_type, "INSUFFICIENT_RESOURCES");
+    }
+
+    /// The same two failures replayed by a poll keep the same split.
+    #[test]
+    fn exceeded_query_memory_limit_poll_replay_has_no_retry_after() {
+        let own = QueryStatus::Failed(Box::new(protocol::TrinoError::from_code(
+            sqe_core::SqeErrorCode::ExceededQueryMemoryLimit,
+            "query.max_query_memory exceeded",
+            Some("q1"),
+        )));
+        let resp = terminal_error_response("http://localhost:8080", "q1", &own).unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(retry_after(&resp), None);
+
+        let load = QueryStatus::Failed(Box::new(protocol::TrinoError::from_code(
+            sqe_core::SqeErrorCode::ResourceExhausted,
+            "pool full",
+            Some("q1"),
+        )));
+        let resp = terminal_error_response("http://localhost:8080", "q1", &load).unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(retry_after(&resp).as_deref(), Some("1"));
+    }
+
     /// Finding 704 acceptance: `updateType` comes from the parsed statement.
     /// `CREATE VIEW` is `CREATE VIEW`, not `CREATE TABLE`.
     #[tokio::test]

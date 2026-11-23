@@ -40,6 +40,7 @@ pub use config::{
 };
 pub use error::{
     classified_by_text_total, CatalogOp, RefusalReason, Result, SqeError, SqeErrorCode,
+    QUERY_MEMORY_LIMIT_SETTING,
 };
 pub use runtime::{build_server_runtime, DEFAULT_RUNTIME_STACK_MIB};
 pub use secret::{Secret, SecretStore, SecretStoreError};

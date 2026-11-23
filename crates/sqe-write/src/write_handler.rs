@@ -2034,15 +2034,15 @@ impl WriteHandler {
         let gate = sqe_planner::SortMemoryRule::new(sqe_planner::sort_grant_bytes(
             &self.config.query.max_query_memory,
         ));
-        // The refusal is `DataFusionError::ResourcesExhausted`; the `From`
-        // conversion keeps it `ResourceExhausted` on the wire. Name the
+        // The refusal is `DataFusionError::ResourcesExhausted` against the
+        // statement's own cap, so it is `ExceededQueryMemoryLimit` (#933). Name the
         // statement shape and the write-side remedy: the planner's text only
         // knows about sorts, the user typed a CTAS/INSERT with ORDER BY.
         let physical = gate
             .optimize(physical, state.config_options())
             .map_err(|e| match e {
                 datafusion::error::DataFusionError::ResourcesExhausted(msg) => SqeError::with_code(
-                    SqeErrorCode::ResourceExhausted,
+                    SqeErrorCode::ExceededQueryMemoryLimit,
                     format!(
                         "{what} with sort-on-write (ORDER BY) cannot be admitted: {msg} \
                              Write without the sort hint or raise query.max_query_memory."
@@ -9838,7 +9838,7 @@ mod tests {
             .expect("64-way merge must not fit a 2 MiB headroom");
         assert_eq!(
             refused.error_code(),
-            SqeErrorCode::ResourceExhausted,
+            SqeErrorCode::ExceededQueryMemoryLimit,
             "{refused}"
         );
         assert!(
