@@ -4,6 +4,88 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+## [0.58.0] — 2026-11-23
+
+### Added
+
+- Signed catalog scopes are checked for their format (`typ`) (#908)
+
+    New `[session.catalog_scope] token_type` (default `sqe-catalog-scope+jwt`) names the scope format SQE reads. A scope whose JOSE header `typ` is that value, the generic `JWT`, or absent is read as before. Any other `typ` is refused with a reason and an audit record, so a later version of an orchestrator's scope format is never read as the current one. The scope's `iss` was already required to equal `issuer`; `iat` is accepted. An orchestrator that sends its own `typ` sets `token_type` to it, as it sets `header_name`.
+
+- `[session.catalog_scope] mode`: `binding` (default, narrows the session to the signed scope), `union` (requires and verifies the scope but does not narrow) or `off`. The mode is logged at startup (#295)
+
+- dbt-sqe: extra Flight SQL call headers from the profile (ai-portal-data #772)
+
+    New profile option `call_headers` (header name to value) sends each header on every Flight SQL call, next to the credentials, so an orchestrator can pass a run's signed catalog scope (`[session.catalog_scope] header_name`, #908). Names are lower-cased; `authorization`, `content-type`, `host`, `te`, `user-agent`, `grpc-*` and `*-bin` are refused, so a profile cannot replace the credentials. A value must be printable ASCII, and an empty value sends nothing. Values never appear in `dbt debug`, the credentials' repr or dbt-sqe's errors. dbt-sqe 1.2.0.
+
+- Table tags are projected into Ranger's tag store, so Spark masks and filters with them as SQE does (#935)
+
+    `ALTER TABLE ... SET TAGS`, `CALL system.reproject_column_tags` and the tag load observer put `sqe.table-tags` on two tag service resources: the table with every column (`column: *`, which Kyuubi needs to apply a tag mask) and the bare table (for tag row filters). Additions reach Ranger before the commit, removals after it. A malformed `sqe.table-tags` never removes or shrinks the projection: Spark does not mask a table with nothing projected, so SQE keeps the last projection and logs an error; own column tags still project. Schema tags are not projected yet.
+
+- Schema tags are projected into Ranger for Spark (#935)
+
+    With `[policy] inherit_schema_tags = true`, a schema's tags are written to Ranger's tag store on the schema-wide resources `{database, table: *, column: *}` and `{database, table: *}`, so a Spark tag mask or tag row filter on a schema tag covers every table in the schema, as it does in SQE. `ALTER SCHEMA ... SET|UNSET TAGS` adds before the commit and removes after it, `CALL system.reproject_column_tags` rewrites the schema-wide resource exactly (a row named `<schema>.*`), and loading a table only adds schema keys Ranger does not hold yet. A schema whose tags cannot be read keeps its projection and logs an error. A table-level change that leaves tags is now one replace in Ranger instead of a delete followed by an add, which left Spark unmasked in between. Turning the setting off or dropping a schema leaves the schema-wide projection in Ranger until it is deleted there.
+
+- Black-box Iceberg matrix feature suite (`tests/matrix/`)
+
+    Runs SQE beside a Polaris + RustFS stack (`tests/matrix/docker/start-sqe.sh`, any `SQE_IMAGE`) and measures each cell of the iceberg-matrix rubric over SQE's client protocols (Trino HTTP and Flight SQL), against the rubric's feature description read literally. Write cells are confirmed by an independent reader (PyIceberg plus raw manifest, Parquet and Puffin reads). The report compares measured with claimed levels, states how many of the 54 cells were measured, lists discrepancies as proposed state-file edits (it never changes the state file), and lists features that work on one protocol but not the other as protocol gaps. Covered so far: table creation, row-level operations, schema, partitioning, time travel, branching and tagging, and table maintenance.
+
+### Changed
+
+- A statement refused by the catalog scope is audited with `error_type` `catalog_not_in_workspace` or `catalog_read_only`; the read-only message names `catalog_read_only`. A hidden catalog still answers "Catalog 'x' not found" (#295)
+
+- `information_schema` reads walk only the catalogs, schemas and tables the query names (#939)
+
+    `information_schema.tables`, `columns`, `views` and `schemata` no longer list and load every table in every catalog before filtering. The walk is limited by the reference's catalog qualifier and by the query's `table_catalog` / `catalog_name`, `table_schema` and `table_name` filters: equality, exact `LIKE`, a literal `IN` list, or an `OR` of those on one column. dbt-sqe's `get_columns_in_relation` now loads one table, and `get_catalog` lists only the schemas it asks for.
+
+    **Behaviour change:** a qualified read returns only its own catalog's rows, as in Trino. `"a".information_schema.tables` used to list every registered catalog. A bare `information_schema` read with a session catalog set is limited to that catalog. A qualifier that contradicts a `table_catalog` filter returns no rows.
+
+### Fixed
+
+- A table the user may not read no longer fails an `information_schema` listing (#939)
+
+    While walking, a table whose load the catalog refuses (403, access denied) is left out of `information_schema`, as Trino does. Any other failure still fails the query (#890): an unreachable catalog (5xx) or a schema SQE cannot convert. A `SELECT` on a denied table still reports access denied.
+
+- `CREATE TABLE IF NOT EXISTS ... AS SELECT` on an existing Iceberg table is a no-op (#897)
+
+    It used to fail with "table already exists", so dbt-trino's `on_table_exists = 'skip'` failed on every run after the first. The existing table is now left as it is and the statement reports 0 rows without running the query, as in Trino. Stock dbt-trino 1.12 was run three times against the Trino endpoint with `on_table_exists` = `rename`, `drop`, `replace` and `skip`, and with `views_enabled = false` incrementals (merge and append); every table held the expected rows and no temporary or backup table was left.
+
+- `system.jdbc` and `system.metadata` tables no longer load every table in the lake (#939)
+
+    The schemas, tables, columns, table_properties, schema_properties and table_comments tables now build their rows at scan time and only for the catalog, schema and table named in the query's equality or exact LIKE filters. An `information_schema` query no longer lists or loads any table through them, and a schema-filtered `system.jdbc` listing no longer lists other schemas, so a listing error there no longer fails it. A table in scope that fails to load is logged and skipped as before; listing errors other than access denied still fail the query. `information_schema.columns` over the Iceberg catalogs can still fail on an unloadable table in another schema; that is fixed separately.
+
+- Ranger tag projection reads back what Ranger holds and cleans up after DROP SCHEMA (#935)
+
+    What Ranger holds for a schema is read back from Ranger before `ALTER SCHEMA ... SET|UNSET TAGS` and `CALL system.reproject_column_tags` write, and by a table load once its 120-second memory of the schema expires, so a second coordinator can no longer skip a write because it remembers a key another coordinator has removed; an unreadable Ranger writes nothing and refuses `ALTER SCHEMA`. Table-level memory older than five minutes is resent. `DROP SCHEMA` deletes the schema-wide projection, and the repair deletes it when `inherit_schema_tags` is off or the schema has no tags. A column whose tags change is now one replace in Ranger instead of a delete followed by an add. Failures are counted in `sqe_tag_projection_failures_total{op="write"|"read"|"source"}`.
+
+- Trino HTTP accepts `FOR VERSION AS OF`, `FOR TIMESTAMP AS OF` and `FOR INCREMENTAL BETWEEN`, as Flight SQL does
+
+    These clauses used to fail on the Trino path with "Expected: one of UPDATE or SHARE", because the front door parsed the statement before the clause was stripped. They are now stripped only to classify the statement, and the executor gets the SQL as the client wrote it.
+
+- `SET WRITE_BRANCH` and `RESET WRITE_BRANCH` work over Trino HTTP
+
+    They used to fail with "session not found in manager". The branch now travels as the session property `iceberg.write_branch`: SQE returns it in `X-Trino-Set-Session`, the client sends it back in `X-Trino-Session`, and the next requests write to that branch. `SET SESSION iceberg.write_branch` works too, and `SHOW SESSION` lists the property. A transaction branch name (`sqe-txn-`) is refused however it arrives.
+
+- `USE [catalog.]schema` works over Trino HTTP
+
+    It failed with "USE: session not found in manager" on a server that also serves Flight SQL. A Trino request runs on a session built from its headers, which the session manager never stores. The scope goes back to the client as `X-Trino-Set-Catalog` and `X-Trino-Set-Schema`, so the coordinator now leaves the stored scope alone for such a session instead of failing.
+
+- Time travel on an unqualified table name reads the table in the session schema, on Flight SQL and Trino HTTP
+
+    `SELECT ... FROM t FOR VERSION AS OF ...` looked `t` up in the namespace `default` whatever schema the session had selected with `USE` or `X-Trino-Schema`.
+
+- The Trino wire test expects `iceberg.write_branch` in `SHOW SESSION`
+
+    `use_and_session_statements_echo_headers` still expected `SHOW SESSION` to list one property, and failed on main since `iceberg.write_branch` joined the allow-list. It now asserts both names in order, the replayed `ZSTD` value and an unset write branch; the golden transcript carries the second row. Tests only.
+
+### Security
+
+- Under `[policy.ranger] catalog_scoped`, a tag policy written in SQL now governs one catalog (#919)
+
+    `CREATE POLICY ... ON TAG pii` stores the policy on `<session catalog>.pii` instead of a bare `pii` that applied in every catalog; a dotted tag is kept as written. `SET MASKING POLICY` on such a policy tags the column with the bare `pii`. `CREATE OR REPLACE POLICY` refuses to move a policy to another tag, which would change the catalogs it governs. A bare tag policy created before keeps applying in every catalog: it can only add a mask. With `catalog_scoped` off nothing changes.
+
+- A warehouse found by `catalog_discovery = "polaris-auto"` no longer inherits the template catalog's engine credential identity, and an engine-identity catalog addressed by its `warehouse` name now denies `select` by default like its config name. Both paths could read rows with the engine's keys without a `select` grant (#940).
+
 ## [0.57.0] — 2026-11-22
 
 ### Added
