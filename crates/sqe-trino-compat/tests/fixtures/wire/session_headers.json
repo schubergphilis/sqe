@@ -253,6 +253,13 @@
           null,
           "varchar",
           "Parquet compression codec for files written by this session (ZSTD, SNAPPY, LZ4, NONE); the coordinator's configured codec applies when unset"
+        ],
+        [
+          "iceberg.write_branch",
+          null,
+          null,
+          "varchar",
+          "Branch that data writes outside a transaction commit to (SET WRITE_BRANCH); main when unset"
         ]
       ],
       "id": "<query-id>",
@@ -265,7 +272,7 @@
         "peakMemoryBytes": 0,
         "physicalInputBytes": 0,
         "processedBytes": 0,
-        "processedRows": 1,
+        "processedRows": 2,
         "queued": false,
         "queuedSplits": 0,
         "queuedTimeMillis": 0,
