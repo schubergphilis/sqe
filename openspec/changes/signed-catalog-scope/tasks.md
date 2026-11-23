@@ -11,6 +11,7 @@
 - [x] 2.3 Fail closed at `create_session_context` / `build_session_catalog` for the scoped client without a valid scope (D3)
 - [x] 2.4 Both cache keys include the scope digest, only when a scope is present
 - [x] 2.5 Producer contract version 1 deltas: `iss` required and equal to `issuer` (already enforced; test for a missing `iss`), `iat` accepted, header `typ` checked against `[session.catalog_scope] token_type` (absent and `JWT` read, others refused)
+- [x] 2.6 Same claim rules as the run gateway: `iss` one string (array refused), trailing `/` of the configured issuer dropped, `token_type = JWT` refused at startup; tests for bad `iss` shapes, missing optional and required claims, unknown `typ` without keys
 
 ## 3. Narrowing
 

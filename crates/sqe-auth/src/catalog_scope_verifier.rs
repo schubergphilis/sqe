@@ -41,6 +41,8 @@ fn refuse(reason: impl Into<String>) -> ScopeRefusal {
 /// Verifies catalog scopes for the one configured client.
 pub struct CatalogScopeVerifier {
     client_id: String,
+    /// The configured issuer without a trailing `/`.
+    issuer: String,
     header_name: String,
     /// The configured scope `typ`, normalised by [`media_type`].
     token_type: String,
@@ -71,9 +73,12 @@ impl CatalogScopeVerifier {
         config
             .validate()
             .map_err(|e| AuthError::Internal(anyhow::anyhow!(e)))?;
+        // As the gateway: a trailing `/` in the configured issuer is not
+        // part of the `iss` the producer mints.
+        let issuer = config.issuer.trim_end_matches('/').to_string();
         let keys = BearerTokenProvider::new(BearerTokenProviderConfig {
             jwks_url: config.jwks_url.clone(),
-            issuer: Some(config.issuer.clone()),
+            issuer: Some(issuer.clone()),
             // A scope has no audience: it is bound to one bearer by `sub`
             // and `jti`, which is narrower than any audience string.
             audience: None,
@@ -86,6 +91,7 @@ impl CatalogScopeVerifier {
         })?;
         Ok(Self {
             client_id: config.client_id.clone(),
+            issuer,
             header_name: config.header_name.to_ascii_lowercase(),
             token_type: media_type(&config.token_type),
             keys,
@@ -133,6 +139,11 @@ impl CatalogScopeVerifier {
                 AuthError::Internal(_) => refuse("the scope issuer's keys are unavailable"),
                 other => refuse(format!("the signature or lifetime is invalid ({other})")),
             })?;
+        // The JWT library also accepts an array `iss` that contains the
+        // issuer; RFC 7519 makes `iss` one string, so require exactly that.
+        if claims.get("iss").and_then(|v| v.as_str()) != Some(self.issuer.as_str()) {
+            return Err(refuse("the scope's `iss` is not the configured issuer"));
+        }
         scope_from_claims(&claims, binding)
     }
 
@@ -436,6 +447,107 @@ Gsk+TB4BOZOZvvRKOPj1Dj5tcKc/tv2Hx8kiS4egVEC2qWmKaBDbv9kN
         let mut c = claims("jti-1", 600);
         c["iss"] = json!("https://evil.example");
         assert!(v.verify(&sign(&c, KID), &binding()).await.is_err());
+    }
+
+    /// `iss` must equal the configured issuer exactly; the gateway applies
+    /// the same rule, so a scope one engine refuses the other refuses too.
+    #[tokio::test]
+    async fn bad_iss_is_refused_whatever_its_shape() {
+        let v = verifier().await;
+        for iss in [
+            json!("https://evil.example"),
+            json!("https://portal.example/"),
+            json!("https://PORTAL.example"),
+            json!("http://portal.example"),
+            json!("https://portal.example.evil"),
+            json!(""),
+            json!(42),
+            json!(["https://portal.example"]),
+        ] {
+            let mut c = contract_claims();
+            c["iss"] = iss.clone();
+            assert!(
+                v.verify(&sign(&c, KID), &binding()).await.is_err(),
+                "iss {iss} must be refused"
+            );
+        }
+    }
+
+    /// A trailing `/` in the configured issuer is dropped, as the gateway
+    /// does, so `issuer = "https://portal.example/"` reads the scopes the
+    /// producer mints with `iss = "https://portal.example"`.
+    #[tokio::test]
+    async fn configured_issuer_trailing_slash_is_dropped() {
+        let jwks_url = jwks_server().await;
+        let config: CatalogScopeConfig = toml::from_str(&format!(
+            "client_id = \"portal-data-runs\"\nissuer = \"{ISSUER}/\"\njwks_url = \"{jwks_url}\"\nallow_insecure_jwks = true"
+        ))
+        .unwrap();
+        let v = CatalogScopeVerifier::new(&config).unwrap();
+        v.verify(&sign(&contract_claims(), KID), &binding())
+            .await
+            .expect("iss without the trailing slash is read");
+    }
+
+    /// Only `iss`, `sub`, `jti`, `exp` and `catalogs` are required. A scope
+    /// without `iat`, `nbf`, `aud` or a `typ` header is read; the gateway
+    /// requires the same set.
+    #[tokio::test]
+    async fn missing_optional_claims_are_read() {
+        let v = verifier_with("token_type = \"portal-catalog-scope+jwt\"").await;
+        let minimal = claims("jti-1", 600);
+        for key in ["iat", "nbf", "aud"] {
+            assert!(
+                minimal.get(key).is_none(),
+                "{key} is not in the base claims"
+            );
+        }
+        for typ in [None, Some("portal-catalog-scope+jwt")] {
+            let scope = v
+                .verify(&sign_typed(&minimal, KID, typ), &binding())
+                .await
+                .unwrap_or_else(|e| panic!("typ {typ:?}: {e}"));
+            assert_eq!(scope.access("sales"), Some(CatalogAccess::ReadWrite));
+        }
+        // An `aud` is not checked: the scope is bound by `sub` and `jti`.
+        let mut with_aud = contract_claims();
+        with_aud["aud"] = json!("some-audience");
+        v.verify(&sign(&with_aud, KID), &binding())
+            .await
+            .expect("an aud claim is accepted and not checked");
+    }
+
+    /// Each required claim is refused when missing.
+    #[tokio::test]
+    async fn missing_required_claims_are_refused() {
+        let v = verifier().await;
+        for key in ["iss", "sub", "jti", "exp", "catalogs"] {
+            let mut c = contract_claims();
+            c.as_object_mut().unwrap().remove(key);
+            assert!(
+                v.verify(&sign(&c, KID), &binding()).await.is_err(),
+                "a scope without {key} must be refused"
+            );
+        }
+    }
+
+    /// An unknown `typ` is refused before any key is fetched, so it fails
+    /// closed even when the issuer's keys cannot be reached.
+    #[tokio::test]
+    async fn unknown_type_is_refused_without_the_keys() {
+        let config: CatalogScopeConfig = toml::from_str(&format!(
+            "client_id = \"portal-data-runs\"\nissuer = \"{ISSUER}\"\njwks_url = \"http://127.0.0.1:9/jwks\"\nallow_insecure_jwks = true\ntoken_type = \"portal-catalog-scope+jwt\""
+        ))
+        .unwrap();
+        let v = CatalogScopeVerifier::new(&config).unwrap();
+        let err = v
+            .verify(
+                &sign_typed(&contract_claims(), KID, Some("portal-catalog-scope-v2+jwt")),
+                &binding(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.0.contains("type is not known"), "{err}");
     }
 
     #[tokio::test]

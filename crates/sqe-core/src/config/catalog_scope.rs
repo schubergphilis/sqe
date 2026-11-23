@@ -110,6 +110,20 @@ impl CatalogScopeConfig {
                 return Err(format!("[session.catalog_scope] {field} must not be empty"));
             }
         }
+        // The generic `JWT` is always read; a `token_type` of `jwt` names no
+        // format of its own, so a versioned scope type could never be
+        // configured. The gateway refuses the same value at startup.
+        let token_type = self.token_type.trim().to_ascii_lowercase();
+        if token_type
+            .strip_prefix("application/")
+            .unwrap_or(&token_type)
+            == "jwt"
+        {
+            return Err(
+                "[session.catalog_scope] token_type must be the scope's own type, not `JWT`"
+                    .to_string(),
+            );
+        }
         if !self.allow_insecure_jwks && !self.jwks_url.starts_with("https://") {
             return Err(
                 "[session.catalog_scope] jwks_url must be https (set allow_insecure_jwks for development)"
@@ -153,6 +167,22 @@ token_type = "portal-catalog-scope+jwt""#,
         assert!(c.validate().is_ok());
         c.token_type = " ".into();
         assert!(c.validate().is_err());
+    }
+
+    /// `JWT` names no format of its own; the gateway refuses it too.
+    #[test]
+    fn token_type_jwt_is_refused() {
+        let mut c = parse(
+            r#"client_id = "c"
+issuer = "i"
+jwks_url = "https://x/jwks""#,
+        );
+        for typ in ["JWT", "jwt", " application/JWT "] {
+            c.token_type = typ.into();
+            assert!(c.validate().is_err(), "{typ}");
+        }
+        c.token_type = "application/portal-catalog-scope+jwt".into();
+        assert!(c.validate().is_ok());
     }
 
     #[test]
