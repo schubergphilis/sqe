@@ -1027,10 +1027,16 @@ pub async fn resolve_effective_policy(
 ///    different resource filter (or two different tag filters) are a
 ///    [`PolicyConflict::RowFilter`] under every precedence (TA-13); see
 ///    [`merge_tag_row_filters`]. Until TA-13 they were ANDed.
-/// 4. **Within-column tag ordering is deterministic.** The first tag in the
-///    stored tag list that has a matching mask in `tag_masks_by_tag` wins.
-///    This is stable because `col_tags` comes from Iceberg property JSON
-///    (parsed order preserved) and the caller iterates it in that order.
+/// 4. **Several tag masks on one column join to the most restrictive.** The
+///    masks of all the column's tags are collected (a tag with no mask for the
+///    user adds nothing) and joined by [`join_masks`], whatever the order of
+///    the tags: `Nullify` beats every mask, `Redact` beats the rest, partial
+///    masks join to their meet (fewest characters shown, no character class
+///    unless all agree), and masks that cannot be joined (for example `Hash`
+///    next to a `PartialMask`) are a [`PolicyConflict::Mask`]:
+///    the column is restricted and the conflict returned. So adding a tag never
+///    loosens a column's mask through another tag. If any tag's CUSTOM template
+///    fails to parse, no tag mask is applied (rule 6).
 /// 5. **Unmappable tags fail closed.** A tag whose mask type is genuinely
 ///    unsupported appears in `unmappable_tags`. A column carrying such a tag is
 ///    RESTRICTED (dropped) when it has no resource mask — mirroring the resource
@@ -1042,12 +1048,13 @@ pub async fn resolve_effective_policy(
 ///    tag, the column name is substituted into the template and the result is
 ///    parsed as a SQL expression via `parse_sql_predicate`. On success the column
 ///    receives `MaskType::Custom(expr)`. On any parse failure the column is
-///    restricted (fail-closed).
+///    restricted (fail-closed) unless a resource mask covers it.
 ///
 /// Under [`MaskPrecedence::Refuse`](sqe_core::config::MaskPrecedence::Refuse)
 /// nothing wins: see [`merge_tag_masks_refusing`]. Under every other
-/// precedence the returned conflicts hold at most the row filter conflict
-/// (rule 3).
+/// precedence the returned conflicts hold the row filter conflict (rule 3) and
+/// the columns whose tag masks cannot be joined (rule 4); a resource mask and
+/// a tag mask never conflict there.
 pub(crate) fn merge_tag_masks(
     policy: &mut ResolvedPolicy,
     col_tags: &HashMap<String, Vec<String>>,
@@ -1067,6 +1074,7 @@ pub(crate) fn merge_tag_masks(
             identity,
         );
     }
+    let mut conflicts = Vec::new();
     for (column, tags) in col_tags {
         // Restricted columns always win — tag cannot un-restrict. This is not
         // configurable: restriction means SQE could not establish a safe value
@@ -1099,72 +1107,160 @@ pub(crate) fn merge_tag_masks(
             policy.restricted_columns.push(column.clone());
             continue;
         }
-        // Apply the first tag that has a matching mask spec (deterministic:
-        // first match in stored tag order).
+        // Collect the mask of EVERY tag on the column and join them into the
+        // most restrictive one (rule 4). A tag without a mask for this user
+        // (for example `MASK_NONE`) contributes nothing.
+        let mut masks: Vec<MaskType> = Vec::new();
+        let mut broken = false;
         for tag in tags {
-            match tag_masks_by_tag.get(tag) {
-                Some(TagMaskSpec::Ready(mask)) => {
-                    policy.column_masks.insert(column.clone(), mask.clone());
-                    break;
-                }
+            let mask = match tag_masks_by_tag.get(tag) {
+                Some(TagMaskSpec::Ready(mask)) => mask.clone(),
                 Some(TagMaskSpec::Custom(template)) => {
                     // Substitute the real column name for the `{col}` placeholder
-                    // and parse the resulting expression. On parse failure restrict
-                    // the column (fail-closed) rather than return it raw.
+                    // and parse the resulting expression.
                     let substituted = template.replace("{col}", column);
                     match parse_sql_predicate(&substituted, identity) {
-                        Ok(expr) => {
-                            policy
-                                .column_masks
-                                .insert(column.clone(), MaskType::Custom(expr));
-                        }
+                        Ok(expr) => MaskType::Custom(expr),
                         Err(e) => {
                             // Do not log `template`: a CUSTOM mask body can embed
                             // sensitive literals or keyed values. Column + tag are
                             // enough to locate the offending Ranger policy.
-                            //
-                            // A broken tag template must not cost the column a
-                            // working resource mask. Under `Tag` precedence this
-                            // arm is now reachable with one already in place, and
-                            // restricting there would turn a readable masked value
-                            // into NULL because a DIFFERENT rule is malformed.
-                            if resource_masked {
-                                warn!(
-                                    column = %column,
-                                    tag = %tag,
-                                    error = %e,
-                                    "CUSTOM tag mask expression failed to parse; \
-                                     keeping the existing resource mask"
-                                );
-                            } else {
-                                warn!(
-                                    column = %column,
-                                    tag = %tag,
-                                    error = %e,
-                                    "CUSTOM tag mask expression failed to parse; \
-                                     restricting column (fail-closed)"
-                                );
-                                policy.restricted_columns.push(column.clone());
-                            }
+                            warn!(
+                                column = %column,
+                                tag = %tag,
+                                error = %e,
+                                "CUSTOM tag mask expression failed to parse"
+                            );
+                            broken = true;
+                            continue;
                         }
                     }
-                    break;
                 }
-                None => { /* tag has no mask for this user; try the next tag */ }
+                None => continue,
+            };
+            if !masks.contains(&mask) {
+                masks.push(mask);
+            }
+        }
+        if broken {
+            // A broken tag template must not cost the column a working resource
+            // mask, and the other tags' masks are not applied: the broken one
+            // may have been the strictest. Restrict only when nothing else
+            // masks the column (fail-closed).
+            if !resource_masked {
+                policy.restricted_columns.push(column.clone());
+            }
+            continue;
+        }
+        if masks.is_empty() {
+            continue;
+        }
+        match join_masks(&masks) {
+            Some(mask) => {
+                policy.column_masks.insert(column.clone(), mask);
+            }
+            None => {
+                // The masks cannot be joined (e.g. `Hash` next to a partial
+                // mask). Same outcome as `Refuse` for this column.
+                policy.column_masks.remove(column);
+                policy.restricted_columns.push(column.clone());
+                conflicts.push(PolicyConflict::Mask(column.clone()));
             }
         }
     }
     // One row filter per table and user, whatever the mask precedence (TA-13).
-    merge_tag_row_filters(policy, tag_filters)
-        .into_iter()
-        .collect()
+    conflicts.extend(merge_tag_row_filters(policy, tag_filters));
+    conflicts.sort();
+    conflicts
+}
+
+/// Join the masks that several tags put on one column into the single most
+/// restrictive one. The result does not depend on the order of `masks`.
+/// `None` means the masks cannot be joined: the caller treats that as a
+/// conflict.
+///
+/// - `Nullify` beats every other mask.
+/// - `Redact(s)` beats every mask except `Nullify`. Two different redaction
+///   strings join to `Nullify`: both reveal nothing, and `Nullify` is at least
+///   as restrictive as either.
+/// - Partial masks join to their meet, see [`meet_partial_masks`].
+/// - Any other mix of distinct masks (`Hash`, `DateShowYear`, `Custom`, or one
+///   of them next to a partial mask) cannot be joined.
+fn join_masks(masks: &[MaskType]) -> Option<MaskType> {
+    if masks.iter().any(|m| matches!(m, MaskType::Nullify)) {
+        return Some(MaskType::Nullify);
+    }
+    let mut redactions: Vec<&String> = Vec::new();
+    for m in masks {
+        if let MaskType::Redact(s) = m {
+            if !redactions.contains(&s) {
+                redactions.push(s);
+            }
+        }
+    }
+    match redactions.as_slice() {
+        [] => {}
+        [one] => return Some(MaskType::Redact((*one).clone())),
+        _ => return Some(MaskType::Nullify),
+    }
+    let first = masks.first()?;
+    if masks.iter().all(|m| m == first) {
+        return Some(first.clone());
+    }
+    meet_partial_masks(masks)
+}
+
+/// The meet of several partial masks: the fewest characters shown at either
+/// end, so it reveals no more than any input. The replacement chars stay when
+/// every input uses the same ones; otherwise the meet reveals no character
+/// class and replaces every character with one char (the smallest class-less
+/// char among the inputs, else Ranger's `x`). Ranger's `MASK` (no characters
+/// shown, classes visible) and `MASK_SHOW_LAST_4` (last four shown, no class)
+/// therefore join to a mask that shows nothing and no class. `None` when a
+/// mask is not a partial mask.
+fn meet_partial_masks(masks: &[MaskType]) -> Option<MaskType> {
+    let mut parts = Vec::with_capacity(masks.len());
+    for m in masks {
+        match m {
+            MaskType::PartialMask {
+                show_first,
+                show_last,
+                upper,
+                lower,
+                digit,
+            } => parts.push((*show_first, *show_last, (*upper, *lower, *digit))),
+            _ => return None,
+        }
+    }
+    let show_first = parts.iter().map(|p| p.0).min()?;
+    let show_last = parts.iter().map(|p| p.1).min()?;
+    let chars = parts[0].2;
+    let (upper, lower, digit) = if parts.iter().all(|p| p.2 == chars) {
+        chars
+    } else {
+        let c = parts
+            .iter()
+            .filter(|p| p.2 .0 == p.2 .1 && p.2 .1 == p.2 .2)
+            .map(|p| p.2 .0)
+            .min()
+            .unwrap_or('x');
+        (c, c, c)
+    };
+    Some(MaskType::PartialMask {
+        show_first,
+        show_last,
+        upper,
+        lower,
+        digit,
+    })
 }
 
 /// A column or table for which policies resolve to different answers.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PolicyConflict {
     /// Two different masks resolve for this column, under
-    /// [`MaskPrecedence::Refuse`](sqe_core::config::MaskPrecedence::Refuse).
+    /// [`MaskPrecedence::Refuse`](sqe_core::config::MaskPrecedence::Refuse),
+    /// or several tag masks on it cannot be joined, under every precedence.
     Mask(String),
     /// Tag row filters and a different filter resolve for the table, under
     /// every precedence (TA-13).

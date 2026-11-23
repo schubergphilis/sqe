@@ -400,8 +400,334 @@ fn merge_tag_masks_first_matching_tag_wins() {
     );
     assert!(
         matches!(policy.column_masks.get("salary"), Some(MaskType::Hash)),
-        "first matching tag mask in stored order must be applied"
+        "the only tag with a mask supplies it"
     );
+}
+
+/// Runs `merge_tag_masks` on column `c` carrying `tags`, with `masks` as the
+/// tag masks and an optional resource mask. Returns the policy and conflicts.
+fn merge_one_column(
+    tags: &[&str],
+    masks: &[(&str, MaskType)],
+    resource: Option<MaskType>,
+    precedence: MaskPrecedence,
+) -> (ResolvedPolicy, Vec<PolicyConflict>) {
+    let mut policy = ResolvedPolicy::default();
+    if let Some(m) = resource {
+        policy.column_masks.insert("c".to_string(), m);
+    }
+    let conflicts = merge_tag_masks(
+        &mut policy,
+        &make_col_tags(&[("c", tags)]),
+        &make_tag_masks(masks),
+        vec![],
+        &no_unmappable(),
+        &default_identity(),
+        precedence,
+    );
+    (policy, conflicts)
+}
+
+fn partial(show_first: u32, show_last: u32) -> MaskType {
+    MaskType::PartialMask {
+        show_first,
+        show_last,
+        upper: 'X',
+        lower: 'x',
+        digit: '#',
+    }
+}
+
+const TAG_AND_RESOURCE: [MaskPrecedence; 2] = [MaskPrecedence::Tag, MaskPrecedence::Resource];
+
+fn assert_joined(tags: &[&str], masks: &[(&str, MaskType)], expected: MaskType) {
+    for precedence in TAG_AND_RESOURCE {
+        let (policy, conflicts) = merge_one_column(tags, masks, None, precedence);
+        assert!(
+            conflicts.is_empty(),
+            "{precedence:?} {tags:?}: {conflicts:?}"
+        );
+        assert_eq!(
+            policy.column_masks.get("c"),
+            Some(&expected),
+            "{precedence:?} {tags:?}"
+        );
+        assert!(!policy.is_restricted("c"), "{precedence:?} {tags:?}");
+    }
+}
+
+fn assert_conflict(tags: &[&str], masks: &[(&str, MaskType)]) {
+    for precedence in TAG_AND_RESOURCE {
+        let (policy, conflicts) = merge_one_column(tags, masks, None, precedence);
+        assert_eq!(
+            conflicts,
+            vec![PolicyConflict::Mask("c".to_string())],
+            "{precedence:?} {tags:?}"
+        );
+        assert!(policy.is_restricted("c"), "{precedence:?} {tags:?}");
+        assert!(policy.mask_for("c").is_none(), "{precedence:?} {tags:?}");
+    }
+}
+
+#[test]
+fn merge_tag_masks_most_restrictive_nullify_beats_a_weaker_tag() {
+    let masks = [("pii", MaskType::Nullify), ("weak", partial(0, 4))];
+    assert_joined(&["pii", "weak"], &masks, MaskType::Nullify);
+    assert_joined(&["weak", "pii"], &masks, MaskType::Nullify);
+}
+
+#[test]
+fn merge_tag_masks_most_restrictive_narrower_partial_mask_wins() {
+    let masks = [("a", partial(0, 2)), ("b", partial(0, 4))];
+    assert_joined(&["a", "b"], &masks, partial(0, 2));
+    assert_joined(&["b", "a"], &masks, partial(0, 2));
+}
+
+#[test]
+fn merge_tag_masks_most_restrictive_a_partial_mask_that_reveals_a_class_joins_classless() {
+    // Narrower, but keeps the character class visible where the other does
+    // not: the meet shows two characters and no class.
+    let classless = MaskType::PartialMask {
+        show_first: 0,
+        show_last: 4,
+        upper: '*',
+        lower: '*',
+        digit: '*',
+    };
+    let meet = MaskType::PartialMask {
+        show_first: 0,
+        show_last: 2,
+        upper: '*',
+        lower: '*',
+        digit: '*',
+    };
+    let masks = [("a", partial(0, 2)), ("b", classless.clone())];
+    assert_joined(&["a", "b"], &masks, meet.clone());
+    assert_joined(&["b", "a"], &masks, meet);
+    // The class-less mask is at least as restrictive when it is also narrower.
+    let narrower_classless = MaskType::PartialMask {
+        show_first: 0,
+        show_last: 2,
+        upper: '*',
+        lower: '*',
+        digit: '*',
+    };
+    let masks = [("a", partial(0, 4)), ("b", narrower_classless.clone())];
+    assert_joined(&["a", "b"], &masks, narrower_classless.clone());
+    assert_joined(&["b", "a"], &masks, narrower_classless);
+}
+
+#[test]
+fn merge_tag_masks_most_restrictive_incomparable_partial_masks_join_to_the_meet() {
+    let masks = [("a", partial(4, 0)), ("b", partial(0, 4))];
+    assert_joined(&["a", "b"], &masks, partial(0, 0));
+    assert_joined(&["b", "a"], &masks, partial(0, 0));
+}
+
+/// Ranger `MASK` (classes visible, nothing shown) and `MASK_SHOW_LAST_4` (last
+/// four shown, no class) on one column join to a mask that shows neither.
+#[test]
+fn merge_tag_masks_most_restrictive_ranger_mask_and_show_last_4_join() {
+    let ranger_mask = MaskType::PartialMask {
+        show_first: 0,
+        show_last: 0,
+        upper: 'X',
+        lower: 'x',
+        digit: 'n',
+    };
+    let show_last_4 = MaskType::PartialMask {
+        show_first: 0,
+        show_last: 4,
+        upper: 'x',
+        lower: 'x',
+        digit: 'x',
+    };
+    let meet = MaskType::PartialMask {
+        show_first: 0,
+        show_last: 0,
+        upper: 'x',
+        lower: 'x',
+        digit: 'x',
+    };
+    let masks = [("pii", ranger_mask), ("card", show_last_4)];
+    assert_joined(&["pii", "card"], &masks, meet.clone());
+    assert_joined(&["card", "pii"], &masks, meet);
+}
+
+#[test]
+fn merge_tag_masks_most_restrictive_a_mask_below_an_incomparable_pair_wins_in_any_order() {
+    let masks = [
+        ("a", partial(4, 0)),
+        ("b", partial(0, 4)),
+        ("c", partial(0, 0)),
+    ];
+    for order in [
+        ["a", "b", "c"],
+        ["a", "c", "b"],
+        ["b", "a", "c"],
+        ["b", "c", "a"],
+        ["c", "a", "b"],
+        ["c", "b", "a"],
+    ] {
+        assert_joined(&order, &masks, partial(0, 0));
+    }
+}
+
+#[test]
+fn merge_tag_masks_most_restrictive_two_different_customs_conflict() {
+    let mut policy = ResolvedPolicy::default();
+    let mut masks = HashMap::new();
+    masks.insert("x".to_string(), TagMaskSpec::Custom("upper({col})".into()));
+    masks.insert("y".to_string(), TagMaskSpec::Custom("lower({col})".into()));
+    for order in [["x", "y"], ["y", "x"]] {
+        for precedence in TAG_AND_RESOURCE {
+            policy.column_masks.clear();
+            policy.restricted_columns.clear();
+            let conflicts = merge_tag_masks(
+                &mut policy,
+                &make_col_tags(&[("c", &order)]),
+                &masks,
+                vec![],
+                &no_unmappable(),
+                &default_identity(),
+                precedence,
+            );
+            assert_eq!(conflicts, vec![PolicyConflict::Mask("c".to_string())]);
+            assert!(policy.is_restricted("c"));
+        }
+    }
+}
+
+#[test]
+fn merge_tag_masks_most_restrictive_custom_with_nullify_is_nullify() {
+    let mut policy = ResolvedPolicy::default();
+    let mut masks = make_tag_masks(&[("n", MaskType::Nullify)]);
+    masks.insert("x".to_string(), TagMaskSpec::Custom("upper({col})".into()));
+    for order in [["x", "n"], ["n", "x"]] {
+        policy.column_masks.clear();
+        let conflicts = merge_tag_masks(
+            &mut policy,
+            &make_col_tags(&[("c", &order)]),
+            &masks,
+            vec![],
+            &no_unmappable(),
+            &default_identity(),
+            MaskPrecedence::Tag,
+        );
+        assert!(conflicts.is_empty());
+        assert_eq!(policy.column_masks.get("c"), Some(&MaskType::Nullify));
+    }
+}
+
+#[test]
+fn merge_tag_masks_most_restrictive_a_broken_custom_applies_no_other_tag_mask() {
+    let mut policy = ResolvedPolicy::default();
+    let mut masks = make_tag_masks(&[("h", MaskType::Hash)]);
+    masks.insert("bad".to_string(), TagMaskSpec::Custom("((( {col}".into()));
+    let conflicts = merge_tag_masks(
+        &mut policy,
+        &make_col_tags(&[("c", &["h", "bad"])]),
+        &masks,
+        vec![],
+        &no_unmappable(),
+        &default_identity(),
+        MaskPrecedence::Tag,
+    );
+    assert!(conflicts.is_empty());
+    assert!(policy.is_restricted("c"));
+    assert!(policy.mask_for("c").is_none());
+}
+
+#[test]
+fn merge_tag_masks_most_restrictive_hash_against_other_masks() {
+    let masks = [("h", MaskType::Hash), ("p", partial(0, 4))];
+    assert_conflict(&["h", "p"], &masks);
+    assert_conflict(&["p", "h"], &masks);
+    let masks = [("h", MaskType::Hash), ("d", MaskType::DateShowYear)];
+    assert_conflict(&["h", "d"], &masks);
+    let masks = [("h", MaskType::Hash), ("r", MaskType::Redact("***".into()))];
+    assert_joined(&["h", "r"], &masks, MaskType::Redact("***".into()));
+    assert_joined(&["r", "h"], &masks, MaskType::Redact("***".into()));
+}
+
+#[test]
+fn merge_tag_masks_most_restrictive_two_redactions_are_nullify() {
+    let masks = [
+        ("a", MaskType::Redact("***".into())),
+        ("b", MaskType::Redact("xxx".into())),
+    ];
+    assert_joined(&["a", "b"], &masks, MaskType::Nullify);
+    assert_joined(&["b", "a"], &masks, MaskType::Nullify);
+    // The same redaction twice is one mask.
+    let masks = [
+        ("a", MaskType::Redact("***".into())),
+        ("b", MaskType::Redact("***".into())),
+    ];
+    assert_joined(&["a", "b"], &masks, MaskType::Redact("***".into()));
+}
+
+#[test]
+fn merge_tag_masks_most_restrictive_a_tag_without_a_mask_adds_nothing() {
+    let masks = [("m", MaskType::Hash)];
+    assert_joined(&["none", "m"], &masks, MaskType::Hash);
+    assert_joined(&["m", "none"], &masks, MaskType::Hash);
+}
+
+#[test]
+fn merge_tag_masks_most_restrictive_is_independent_of_tag_order() {
+    let masks = [
+        ("p", partial(0, 4)),
+        ("n", MaskType::Nullify),
+        ("h", MaskType::Hash),
+    ];
+    for order in [
+        ["p", "n", "h"],
+        ["p", "h", "n"],
+        ["n", "p", "h"],
+        ["n", "h", "p"],
+        ["h", "p", "n"],
+        ["h", "n", "p"],
+    ] {
+        assert_joined(&order, &masks, MaskType::Nullify);
+    }
+    // Redact absorbs a pair that cannot be joined in every order.
+    let masks = [
+        ("p", partial(0, 4)),
+        ("r", MaskType::Redact("*".into())),
+        ("h", MaskType::Hash),
+    ];
+    for order in [
+        ["p", "r", "h"],
+        ["p", "h", "r"],
+        ["r", "p", "h"],
+        ["r", "h", "p"],
+        ["h", "p", "r"],
+        ["h", "r", "p"],
+    ] {
+        assert_joined(&order, &masks, MaskType::Redact("*".into()));
+    }
+}
+
+#[test]
+fn merge_tag_masks_most_restrictive_tag_winner_replaces_a_resource_mask_under_tag() {
+    let masks = [("a", partial(0, 4)), ("b", MaskType::Nullify)];
+    let (policy, conflicts) = merge_one_column(
+        &["a", "b"],
+        &masks,
+        Some(MaskType::Hash),
+        MaskPrecedence::Tag,
+    );
+    assert!(conflicts.is_empty());
+    assert_eq!(policy.column_masks.get("c"), Some(&MaskType::Nullify));
+    // Under `Resource` the resource mask stands and the tags are skipped.
+    let (policy, conflicts) = merge_one_column(
+        &["a", "b"],
+        &masks,
+        Some(MaskType::Hash),
+        MaskPrecedence::Resource,
+    );
+    assert!(conflicts.is_empty());
+    assert_eq!(policy.column_masks.get("c"), Some(&MaskType::Hash));
 }
 
 #[test]

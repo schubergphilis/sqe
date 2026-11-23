@@ -6788,6 +6788,76 @@ async fn tag_removal_remove_tag_is_a_grant_of_its_own() {
     tag_authority_cleanup(&ctx, &rig, &[]).await;
 }
 
+/// #942: a steward holding `apply_tag` only adds a second tag (`PII`, the rig's
+/// `MASK_SHOW_LAST_4`) whose mask is weaker than the one already on the column
+/// (`SECRET`, `MASK_NULL`). `PII` sorts before `SECRET`, so the old first-tag-wins
+/// merge would have loosened the column. Readers still see NULL.
+///
+/// Runs under `tag` precedence; `resource` is the same code path, and under
+/// `refuse` the write is refused by the existing #918 guard.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn weaker_tag_does_not_loosen_a_masked_column_live() {
+    use sqe_core::config::{TagPrivilege, TagRemoval};
+    ac_gate!();
+    if suite_precedence() != MaskPrecedence::Tag {
+        return;
+    }
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    let rig =
+        tag_authority_rig_full(&ctx, true, TagPrivilege::ApplyTag, TagRemoval::RemoveTag).await;
+    let apply = format!("{PREFIX}apply-tag-dave-ssn");
+    let _ = ctx.ranger.delete_policy(HIVE_SERVICE, &apply).await;
+    ctx.ranger
+        .create_policy(apply_tag_allow_policy(&apply, "ssn"))
+        .await
+        .expect("create apply_tag on ssn");
+    // The rig's `PII` tag policy is MASK_SHOW_LAST_4, the weaker mask. `SECRET`
+    // is the stronger one and is stored on the column first.
+    let nullify = format!("{PREFIX}tag-nullify-secret");
+    let _ = ctx.ranger.delete_policy(TAG_SERVICE, &nullify).await;
+    ctx.ranger
+        .create_policy(tag_mask_policy(
+            &nullify,
+            "SECRET",
+            serde_json::json!({"dataMaskType": "hive:MASK_NULL"}),
+        ))
+        .await
+        .expect("create the MASK_NULL tag policy");
+
+    // The admin classifies ssn as SECRET: NULL for bob.
+    set_column_tag(&ctx, "ssn", "SECRET").await;
+    bob_sees(&ctx, "ssn", &["NULL", "NULL", "NULL"]).await;
+
+    // dave (apply_tag only) adds the weaker tag.
+    let add = format!("ALTER TABLE {ORDERS} ALTER COLUMN ssn SET TAGS ('PII' = 'x')");
+    crate::common::eventually("dave to add the weaker tag", || async {
+        rig.handler
+            .execute(&ctx.dave, &add, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    bob_sees(&ctx, "ssn", &["NULL", "NULL", "NULL"]).await;
+
+    // Control: with SECRET removed, the weaker tag's policy is live and applies.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn UNSET TAG SECRET"),
+    )
+    .await;
+    bob_sees(&ctx, "ssn", &SSN_MASKED).await;
+
+    let _ = ctx.ranger.delete_policy(HIVE_SERVICE, &apply).await;
+    let _ = ctx.ranger.delete_policy(TAG_SERVICE, &nullify).await;
+    tag_authority_cleanup(&ctx, &rig, &[]).await;
+}
+
 /// Under `tag_removal = "admin"` dave tags with `alter` but cannot untag; the
 /// admin can.
 #[tokio::test(flavor = "multi_thread")]

@@ -1,8 +1,9 @@
 //! Refuse a tag write that creates a policy conflict (#918). A read already
 //! fails on a conflict; this refuses the write that would cause one, for every
 //! principal the table's policies name. A row-filter conflict (TA-13, #931: one
-//! row filter per table and user) is refused under every `mask_precedence`; a
-//! mask conflict only under `refuse`, the one mode where masks conflict.
+//! row filter per table and user) is refused under every `mask_precedence`. A
+//! mask conflict is refused under `refuse` (any two different masks) and under
+//! `tag` and `resource` when the column's tag masks cannot be joined.
 //!
 //! Design: `openspec/changes/policy-conflict-refuse-at-write/design.md`.
 
@@ -160,8 +161,14 @@ impl TagConflictGuard {
     fn refusal(&self, conflict: &PolicyConflict) -> SqeError {
         let what = match conflict {
             PolicyConflict::Mask(column) => format!(
-                "a mask conflict on {}.{column} under mask_precedence = refuse",
-                self.display
+                "a mask conflict on {}.{column} under mask_precedence = {} \
+                 (masks that cannot be joined)",
+                self.display,
+                match self.precedence {
+                    MaskPrecedence::Tag => "tag",
+                    MaskPrecedence::Resource => "resource",
+                    MaskPrecedence::Refuse => "refuse",
+                }
             ),
             PolicyConflict::RowFilter => format!(
                 "a row filter conflict on {} (one row filter per table and user)",
@@ -196,7 +203,8 @@ mod tests {
     use std::sync::Mutex;
 
     /// Resource mask `MASK_HASH` on `amount` for role `eng`; tag `null` masks
-    /// `MASK_NULL` and tag `hash` masks `MASK_HASH` for `eng`; tag `f` adds a
+    /// `MASK_NULL`, tag `hash` masks `MASK_HASH` and tag `pm` masks
+    /// `MASK_SHOW_LAST_4` for `eng`; tag `f` adds a
     /// row filter for `eng` that differs from the resource one.
     /// With `scoped`, tag `c.x` (catalog `c`'s policy on `x`) masks
     /// `MASK_NULL` for `eng`, and `conflict_principals` records its tags.
@@ -275,6 +283,18 @@ mod tests {
                 }
                 if tags.contains("hash") {
                     masks.insert("hash".into(), TagMaskSpec::Ready(MaskType::Hash));
+                }
+                if tags.contains("pm") {
+                    masks.insert(
+                        "pm".into(),
+                        TagMaskSpec::Ready(MaskType::PartialMask {
+                            show_first: 0,
+                            show_last: 4,
+                            upper: 'X',
+                            lower: 'x',
+                            digit: '#',
+                        }),
+                    );
                 }
                 if tags.contains("f") {
                     filters.push(col("region").eq(lit("us")));
@@ -482,5 +502,62 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{precedence:?}: {e}"));
         }
+    }
+
+    /// Tag masks that cannot be joined conflict under every precedence, and the
+    /// write that creates the conflict is refused (#942).
+    #[tokio::test]
+    async fn tag_conflict_guard_most_restrictive_refuses_a_tag_mask_that_cannot_be_joined() {
+        for precedence in [MaskPrecedence::Tag, MaskPrecedence::Resource] {
+            let err = guard(stub(Some(vec![eng()])))
+                .with_precedence(precedence)
+                .check(
+                    &tags(&[("ssn", &["hash"])]),
+                    &tags(&[("ssn", &["hash", "pm"])]),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("mask conflict on c.ac.orders.ssn"), "{err}");
+            assert!(err.contains("cannot be joined"), "{err}");
+            assert!(!err.contains("= refuse"), "{precedence:?}: {err}");
+        }
+    }
+
+    /// A weaker mask next to `MASK_NULL` is allowed, and the column still reads
+    /// NULL.
+    #[tokio::test]
+    async fn tag_conflict_guard_most_restrictive_allows_a_weaker_tag_next_to_nullify() {
+        let before = tags(&[("ssn", &["null"])]);
+        let after = tags(&[("ssn", &["pm", "null"])]);
+        guard(stub(Some(vec![eng()])))
+            .with_precedence(MaskPrecedence::Tag)
+            .check(&before, &after)
+            .await
+            .unwrap();
+        let (masks, filters, unmappable) = crate::tag_scope::resolve_tags_in_catalog(
+            stub(None).as_ref(),
+            &eng(),
+            &tag_set(&after),
+            None,
+        )
+        .await;
+        let mut policy = ResolvedPolicy::default();
+        let conflicts = merge_tag_masks(
+            &mut policy,
+            &after,
+            &masks,
+            filters,
+            &unmappable,
+            &SessionIdentity {
+                username: "u".into(),
+                roles: vec![],
+                database: None,
+                schema: None,
+            },
+            MaskPrecedence::Tag,
+        );
+        assert!(conflicts.is_empty());
+        assert!(matches!(policy.mask_for("ssn"), Some(MaskType::Nullify)));
     }
 }

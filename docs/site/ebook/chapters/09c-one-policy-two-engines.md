@@ -151,7 +151,7 @@ The write goes through a Polaris `updateProperties` commit, after which SQE inva
 
 Storing associations as a table property, rather than in the Ranger or Atlas tag store, wins on four counts. The associations cover federated catalogs Polaris cannot gate. They need no Atlas or tagsync deployment. They travel with the data through clone, replicate, and rename. And SQE already reads the table metadata on every scan, so reading one more property is free.
 
-The merge has a locked precedence contract, because tags and resource policies can both touch the same column. Restricted columns always win; a tag cannot un-restrict a column. A resource mask wins over a tag mask. Tag row filters are ANDed with resource row filters, most restrictive. Within a column, the first matching tag in stored order wins, deterministically. An unmappable tag whose column has no resource mask restricts the column, fail-closed.
+The merge has a locked precedence contract, because tags and resource policies can both touch the same column. Restricted columns always win; a tag cannot un-restrict a column. A resource mask wins over a tag mask. Tag row filters are ANDed with resource row filters, most restrictive. Within a column, the masks of all its tags are joined into the most restrictive one, in any tag order, and tag masks that cannot be joined are a conflict. An unmappable tag whose column has no resource mask restricts the column, fail-closed.
 
 ## The tag mask that was never a mask
 
