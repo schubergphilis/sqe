@@ -75,12 +75,15 @@ pub trait ReadGate: Send + Sync {
     ///
     /// `loaded` is the table as the person's own load returned it: tag-based
     /// policies resolve from its properties and schema, plus `schema_tags`
-    /// (its schema's tags, empty unless `policy.inherit_schema_tags` is on).
+    /// (its schema's tags, empty unless `policy.inherit_schema_tags` is on),
+    /// plus `catalog_tags` (its catalog's, empty unless
+    /// `policy.inherit_catalog_tags` is on).
     async fn may_read(
         &self,
         table: &TableIdent,
         loaded: &Table,
         schema_tags: &[ColumnTag],
+        catalog_tags: &[ColumnTag],
     ) -> sqe_core::Result<bool>;
 }
 

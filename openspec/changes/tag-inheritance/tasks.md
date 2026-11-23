@@ -7,13 +7,18 @@
 - [x] 1.5 IT (in-process policy store): table-tag mask and UNSET, row filter on SELECT / UPDATE / DELETE / SHOW STATS (MERGE in `merge_row_filter_e2e`, tag cases), inherited conflict refused, malformed table tags refused
 - [x] 1.6 Docs: fine-grained access control page
 
-## 2. Schema (second MR), catalog later
+## 2. Schema (second MR), catalog (#924)
 
 - [x] 2.0 `policy.inherit_schema_tags` (default false), TOML and env; config docs (D8)
-- [x] 2.1 Read `sqe.schema-tags` with the table load, no cache (D8); a namespace cache is a later, measured change. Catalog tags: TODO (#924)
+- [x] 2.1 Read `sqe.schema-tags` with the table load, no cache (D8); a namespace cache is a later, measured change
 - [x] 2.2 A 403, error or malformed schema property refuses the table (D3, D8); the provider constructor takes the schema tag state, no default
-- [x] 2.3 Effective tags = column, then table, then schema (nearest wins); catalog later
+- [x] 2.3 Effective tags = column, then table, then schema (nearest wins); catalog in 2.5-2.8
 - [x] 2.4 IT: flag off ignores schema tags; a schema tag masks a table created after the tag and a table another session already read; UNSET restores; malformed refuses; UPDATE/DELETE skip hidden rows
+- [x] 2.5 `policy.inherit_catalog_tags` (default false), TOML and env; config docs (D9)
+- [x] 2.6 Read `sqe.catalog-tags` with the table load via `catalog_properties()`, no cache (D9); `CatalogTagState` required constructor argument; unreadable or malformed refuses
+- [x] 2.7 Effective tags = column, then table, schema, catalog (nearest wins); `CacheTagSource`, SHOW STATS, write guards and the engine read gate follow
+- [x] 2.8 IT `catalog_tag_inheritance_e2e`: flag off ignores catalog tags; a catalog tag masks every table, also one created later and one another session read; independent of the schema flag; malformed refuses; UPDATE/DELETE skip hidden rows
+- [ ] 2.9 Ranger projection of catalog tags (not planned: catalog tags stay SQE-only, see D9)
 
 ## 3. Follow-ups
 

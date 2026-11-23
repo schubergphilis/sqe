@@ -1498,6 +1498,11 @@ pub struct SessionCatalog {
     /// [`Self::schema_tag_state`]. Off by default; set with
     /// [`Self::with_inherit_schema_tags`].
     inherit_schema_tags: bool,
+    /// `policy.inherit_catalog_tags` (#924): every table load that builds a
+    /// scan provider also reads the catalog's `sqe.catalog-tags`, through
+    /// [`Self::catalog_tag_state`]. Off by default; set with
+    /// [`Self::with_inherit_catalog_tags`]. Independent of the schema flag.
+    inherit_catalog_tags: bool,
     /// Engine credential identity (#934): the token source, select gate and
     /// audit sink of a catalog that reads with the engine's keys. `None`
     /// for every other catalog. See `engine_credentials`.
@@ -1830,6 +1835,7 @@ impl SessionCatalog {
             table_cache: table_cache.unwrap_or_else(|| TableMetadataCache::new(0)),
             scope_guard: None,
             inherit_schema_tags: false,
+            inherit_catalog_tags: false,
             engine: None,
             write_inner: None,
             cache_tag: "",
@@ -1860,6 +1866,7 @@ impl SessionCatalog {
             table_cache: TableMetadataCache::new(0),
             scope_guard: None,
             inherit_schema_tags: false,
+            inherit_catalog_tags: false,
             engine: None,
             write_inner: None,
             cache_tag: "",
@@ -1909,7 +1916,8 @@ impl SessionCatalog {
         Ok(
             Self::for_session_with(&config.catalog, &config.storage, table_cache, bearer_token)
                 .await?
-                .with_inherit_schema_tags(config.policy.inherit_schema_tags),
+                .with_inherit_schema_tags(config.policy.inherit_schema_tags)
+                .with_inherit_catalog_tags(config.policy.inherit_catalog_tags),
         )
     }
 
@@ -2047,6 +2055,7 @@ impl SessionCatalog {
             table_cache,
             scope_guard: None,
             inherit_schema_tags: false,
+            inherit_catalog_tags: false,
             engine: None,
             write_inner: None,
             cache_tag: "",
@@ -2232,6 +2241,7 @@ impl SessionCatalog {
             table_cache,
             scope_guard: None,
             inherit_schema_tags: false,
+            inherit_catalog_tags: false,
             engine: None,
             write_inner: None,
             cache_tag: "",
@@ -2278,7 +2288,8 @@ impl SessionCatalog {
         .await?;
         Ok(sibling
             .with_catalog_scope(scope, warehouse)
-            .with_inherit_schema_tags(self.inherit_schema_tags))
+            .with_inherit_schema_tags(self.inherit_schema_tags)
+            .with_inherit_catalog_tags(self.inherit_catalog_tags))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2467,6 +2478,7 @@ impl SessionCatalog {
             table_cache,
             scope_guard: None,
             inherit_schema_tags: false,
+            inherit_catalog_tags: false,
             engine: None,
             write_inner,
             cache_tag: "",
@@ -2513,6 +2525,27 @@ impl SessionCatalog {
                 SchemaTagState::Unknown
             }
         }
+    }
+
+    /// Read the catalog's tags for every table this catalog loads for a scan
+    /// (`policy.inherit_catalog_tags`, #924).
+    pub fn with_inherit_catalog_tags(mut self, on: bool) -> Self {
+        self.inherit_catalog_tags = on;
+        self
+    }
+
+    /// The catalog tag state a scan provider for a table of this catalog is
+    /// built with: [`CatalogTagState::NotInherited`] without a catalog call
+    /// when the flag is off, else one management-API read of the catalog
+    /// entity with this session's token (no cache). A 403, any error or a
+    /// malformed value is `Unknown`; a catalog that is not Polaris REST has no
+    /// catalog tags (`Known` and empty).
+    pub async fn catalog_tag_state(&self) -> crate::catalog_tags::CatalogTagState {
+        use crate::catalog_tags::CatalogTagState;
+        if !self.inherit_catalog_tags {
+            return CatalogTagState::NotInherited;
+        }
+        CatalogTagState::from_properties_result(self.catalog_properties().await)
     }
 
     /// Bind this catalog to `session`'s catalog scope under the SQL name

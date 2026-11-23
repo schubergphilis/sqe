@@ -265,6 +265,13 @@ mask_precedence = "tag"
 # tables. Off by default; with it on, a schema whose tags cannot be read
 # refuses every read of its tables.
 inherit_schema_tags = false
+# A catalog's tags (ALTER CATALOG ... SET TAGS) apply to every column of every
+# table in it, independent of inherit_schema_tags. Off by default; with it on,
+# a catalog whose tags cannot be read refuses every read of its tables, so
+# every principal that reads tables in it needs CATALOG_READ_PROPERTIES on the
+# Polaris catalog (without it reads are refused, not unmasked).
+# Enforced by SQE only, not projected to Ranger.
+inherit_catalog_tags = false
 
 [session]
 idle_timeout_secs = 900         # 15 min, sessions idle longer are expired
@@ -511,6 +518,7 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | `SQE_POLICY__ENGINE` | `policy.engine` | string |
 | `SQE_POLICY__MASK_PRECEDENCE` | `policy.mask_precedence` | string |
 | `SQE_POLICY__INHERIT_SCHEMA_TAGS` | `policy.inherit_schema_tags` | bool |
+| `SQE_POLICY__INHERIT_CATALOG_TAGS` | `policy.inherit_catalog_tags` | bool |
 | **Session** | | |
 | `SQE_SESSION__IDLE_TIMEOUT_SECS` | `session.idle_timeout_secs` | u64 |
 | `SQE_SESSION__ABSOLUTE_TIMEOUT_SECS` | `session.absolute_timeout_secs` | u64 |

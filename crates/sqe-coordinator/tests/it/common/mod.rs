@@ -83,7 +83,7 @@ pub async fn setup_handler_with_store(
     store: Arc<dyn sqe_policy::PolicyStore>,
 ) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
     let rewriter = sqe_policy::plan_rewriter::PolicyPlanRewriter::new(Arc::clone(&store));
-    setup_handler_with_rewriter(store, rewriter, None, None).await
+    setup_handler_with_rewriter(store, rewriter, None, None, None).await
 }
 
 /// [`setup_handler_with_store`] with tags wired as production does: each
@@ -97,7 +97,7 @@ pub async fn setup_handler_with_tag_store(
     store: Arc<dyn sqe_policy::PolicyStore>,
     precedence: sqe_core::config::MaskPrecedence,
 ) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
-    setup_tag_handler(store, precedence, None).await
+    setup_tag_handler(store, precedence, None, None).await
 }
 
 /// [`setup_handler_with_tag_store`] with `policy.inherit_schema_tags` set
@@ -108,14 +108,33 @@ pub async fn setup_handler_with_schema_tag_inheritance(
     precedence: sqe_core::config::MaskPrecedence,
     inherit: bool,
 ) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
-    setup_tag_handler(store, precedence, Some(inherit)).await
+    setup_tag_handler(store, precedence, Some(inherit), None).await
+}
+
+/// [`setup_handler_with_tag_store`] with `policy.inherit_catalog_tags` set
+/// to `inherit` and schema tag inheritance off, whatever the config says.
+/// On, the catalog's `sqe.catalog-tags` join the columns' effective tags
+/// (#924).
+pub async fn setup_handler_with_catalog_tag_inheritance(
+    store: Arc<dyn sqe_policy::PolicyStore>,
+    precedence: sqe_core::config::MaskPrecedence,
+    inherit: bool,
+) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
+    setup_tag_handler(store, precedence, Some(false), Some(inherit)).await
 }
 
 async fn setup_tag_handler(
     store: Arc<dyn sqe_policy::PolicyStore>,
     precedence: sqe_core::config::MaskPrecedence,
     inherit_override: Option<bool>,
+    catalog_override: Option<bool>,
 ) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
+    let inherit_catalog = catalog_override.unwrap_or_else(|| {
+        sqe_core::SqeConfig::load(&test_config_path())
+            .expect("Failed to load test config")
+            .policy
+            .inherit_catalog_tags
+    });
     let inherit = inherit_override.unwrap_or_else(|| {
         sqe_core::SqeConfig::load(&test_config_path())
             .expect("Failed to load test config")
@@ -124,12 +143,20 @@ async fn setup_tag_handler(
     });
     let cache = sqe_catalog::TableMetadataCache::new(30);
     let tags = sqe_coordinator::tag_source_impl::CacheTagSource::new(Arc::new(cache.clone()))
-        .with_inherit_schema_tags(inherit);
+        .with_inherit_schema_tags(inherit)
+        .with_inherit_catalog_tags(inherit_catalog);
     let rewriter = sqe_policy::plan_rewriter::PolicyPlanRewriter::new(Arc::clone(&store))
         .with_mask_precedence(precedence)
         .with_scan_tags(sqe_coordinator::tag_source_impl::scan_column_tags)
         .with_tag_source(Arc::new(tags));
-    setup_handler_with_rewriter(store, rewriter, Some(cache), inherit_override).await
+    setup_handler_with_rewriter(
+        store,
+        rewriter,
+        Some(cache),
+        inherit_override,
+        catalog_override,
+    )
+    .await
 }
 
 async fn setup_handler_with_rewriter(
@@ -137,12 +164,16 @@ async fn setup_handler_with_rewriter(
     rewriter: sqe_policy::plan_rewriter::PolicyPlanRewriter,
     table_cache: Option<sqe_catalog::TableMetadataCache>,
     inherit_override: Option<bool>,
+    catalog_override: Option<bool>,
 ) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
     init_tracing();
     let mut config =
         sqe_core::SqeConfig::load(&test_config_path()).expect("Failed to load test config");
     if let Some(inherit) = inherit_override {
         config.policy.inherit_schema_tags = inherit;
+    }
+    if let Some(inherit) = catalog_override {
+        config.policy.inherit_catalog_tags = inherit;
     }
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await

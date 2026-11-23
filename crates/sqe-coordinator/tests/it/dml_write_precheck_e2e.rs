@@ -21,7 +21,7 @@ use object_store::ObjectStore;
 use sqe_core::{SecretString, Session, SqeConfig, SqeErrorCode};
 
 pub(crate) const POLARIS: &str = "http://localhost:18181/api";
-const CATALOG: &str = "test_warehouse";
+pub(crate) const CATALOG: &str = "test_warehouse";
 const READER: &str = "dml_precheck_reader";
 const PROPS_WRITER: &str = "dml_precheck_props";
 const TABLE: &str = "test_ns.dml_precheck_t";

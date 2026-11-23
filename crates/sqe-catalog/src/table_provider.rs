@@ -13,6 +13,7 @@ use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
 use tracing::{debug, warn};
 
+use crate::catalog_tags::CatalogTagState;
 use crate::expr_to_predicate;
 use crate::iceberg_scan::ScanTuning;
 use crate::schema_tags::SchemaTagState;
@@ -49,6 +50,9 @@ pub struct SqeTableProvider {
     /// The tags of the table's schema, read in the same step as the table
     /// (#924). Required at construction: see [`SchemaTagState`].
     schema_tags: SchemaTagState,
+    /// The tags of the table's catalog, read in the same step (#924).
+    /// Required at construction: see [`CatalogTagState`].
+    catalog_tags: CatalogTagState,
 }
 
 impl SqeTableProvider {
@@ -62,9 +66,14 @@ impl SqeTableProvider {
     ///
     /// `schema_tags` is what the caller read of the table's schema tags in
     /// the same step as the table; pass [`SchemaTagState::NotInherited`] only
-    /// when `policy.inherit_schema_tags` is off.
-    pub async fn try_new(table: Table, schema_tags: SchemaTagState) -> sqe_core::Result<Self> {
-        Self::try_new_inner(table, None, schema_tags)
+    /// when `policy.inherit_schema_tags` is off. `catalog_tags` is the same
+    /// for the catalog's tags and `policy.inherit_catalog_tags`.
+    pub async fn try_new(
+        table: Table,
+        schema_tags: SchemaTagState,
+        catalog_tags: CatalogTagState,
+    ) -> sqe_core::Result<Self> {
+        Self::try_new_inner(table, None, schema_tags, catalog_tags)
     }
 
     /// Create a provider pinned to `snapshot_id`, declaring the schema that
@@ -76,14 +85,16 @@ impl SqeTableProvider {
         table: Table,
         snapshot_id: i64,
         schema_tags: SchemaTagState,
+        catalog_tags: CatalogTagState,
     ) -> sqe_core::Result<Self> {
-        Self::try_new_inner(table, Some(snapshot_id), schema_tags)
+        Self::try_new_inner(table, Some(snapshot_id), schema_tags, catalog_tags)
     }
 
     fn try_new_inner(
         table: Table,
         snapshot_id: Option<i64>,
         schema_tags: SchemaTagState,
+        catalog_tags: CatalogTagState,
     ) -> sqe_core::Result<Self> {
         let table_name = table.identifier().name().to_string();
         debug!(table = %table_name, snapshot_id, "Creating SqeTableProvider");
@@ -100,12 +111,18 @@ impl SqeTableProvider {
             tuning,
             reloader: None,
             schema_tags,
+            catalog_tags,
         })
     }
 
     /// The tags of the table's schema this provider was built with.
     pub fn schema_tags(&self) -> &SchemaTagState {
         &self.schema_tags
+    }
+
+    /// The tags of the table's catalog this provider was built with.
+    pub fn catalog_tags(&self) -> &CatalogTagState {
+        &self.catalog_tags
     }
 
     /// The Iceberg table (and its FileIO) this provider scans.
@@ -637,6 +654,7 @@ mod snapshot_schema_tests {
     use iceberg::{NamespaceIdent, TableIdent};
 
     use super::SqeTableProvider;
+    use crate::catalog_tags::CatalogTagState::NotInherited as CatalogNone;
     use crate::schema_tags::SchemaTagState::NotInherited;
 
     const SNAP_ONLY_X: i64 = 100;
@@ -718,7 +736,7 @@ mod snapshot_schema_tests {
         use sqe_core::json_columns::is_marked;
 
         let table = evolved_table_with_properties(r#"{"sqe.json-columns": "[\"y\"]"}"#);
-        let provider = SqeTableProvider::try_new(table, NotInherited)
+        let provider = SqeTableProvider::try_new(table, NotInherited, CatalogNone)
             .await
             .unwrap();
         let y = provider.schema.field_with_name("y").unwrap();
@@ -739,13 +757,14 @@ mod snapshot_schema_tests {
             evolved_table_with_properties(r#"{"sqe.json-columns": "[\"y\"]"}"#),
             SNAP_X_AND_Y,
             NotInherited,
+            CatalogNone,
         )
         .await
         .unwrap();
         assert!(is_marked(old.schema.field_with_name("y").unwrap()));
         assert!(!is_marked(old.schema.field_with_name("x").unwrap()));
 
-        let plain = SqeTableProvider::try_new(evolved_table(), NotInherited)
+        let plain = SqeTableProvider::try_new(evolved_table(), NotInherited, CatalogNone)
             .await
             .unwrap();
         assert!(!is_marked(plain.schema.field_with_name("y").unwrap()));
@@ -782,7 +801,7 @@ mod snapshot_schema_tests {
             string_view: false,
             static_row_filter: true,
         };
-        let provider = SqeTableProvider::try_new(evolved_table(), NotInherited)
+        let provider = SqeTableProvider::try_new(evolved_table(), NotInherited, CatalogNone)
             .await
             .unwrap()
             .with_tuning(tuning.clone());
@@ -804,7 +823,7 @@ mod snapshot_schema_tests {
 
     #[tokio::test]
     async fn current_provider_declares_the_current_schema() {
-        let provider = SqeTableProvider::try_new(evolved_table(), NotInherited)
+        let provider = SqeTableProvider::try_new(evolved_table(), NotInherited, CatalogNone)
             .await
             .unwrap();
         assert_eq!(column_names(&provider), ["y"]);
@@ -813,7 +832,7 @@ mod snapshot_schema_tests {
     /// ADD COLUMN then time travel: the added column must be absent.
     #[tokio::test]
     async fn with_snapshot_id_hides_columns_added_after_the_snapshot() {
-        let provider = SqeTableProvider::try_new(evolved_table(), NotInherited)
+        let provider = SqeTableProvider::try_new(evolved_table(), NotInherited, CatalogNone)
             .await
             .unwrap()
             .with_snapshot_id(SNAP_ONLY_X);
@@ -824,7 +843,7 @@ mod snapshot_schema_tests {
     /// DROP COLUMN then time travel: the dropped column must be present.
     #[tokio::test]
     async fn with_snapshot_id_keeps_columns_dropped_after_the_snapshot() {
-        let provider = SqeTableProvider::try_new(evolved_table(), NotInherited)
+        let provider = SqeTableProvider::try_new(evolved_table(), NotInherited, CatalogNone)
             .await
             .unwrap()
             .with_snapshot_id(SNAP_X_AND_Y);
@@ -834,11 +853,15 @@ mod snapshot_schema_tests {
     #[tokio::test]
     async fn try_new_at_snapshot_matches_with_snapshot_id() {
         let table = evolved_table();
-        let direct =
-            SqeTableProvider::try_new_at_snapshot(table.clone(), SNAP_X_AND_Y, NotInherited)
-                .await
-                .unwrap();
-        let chained = SqeTableProvider::try_new(table, NotInherited)
+        let direct = SqeTableProvider::try_new_at_snapshot(
+            table.clone(),
+            SNAP_X_AND_Y,
+            NotInherited,
+            CatalogNone,
+        )
+        .await
+        .unwrap();
+        let chained = SqeTableProvider::try_new(table, NotInherited, CatalogNone)
             .await
             .unwrap()
             .with_snapshot_id(SNAP_X_AND_Y);
@@ -859,12 +882,12 @@ mod snapshot_schema_tests {
     /// falls back to the current schema instead of failing.
     #[tokio::test]
     async fn unknown_or_current_snapshot_falls_back_to_current_schema() {
-        let provider = SqeTableProvider::try_new(evolved_table(), NotInherited)
+        let provider = SqeTableProvider::try_new(evolved_table(), NotInherited, CatalogNone)
             .await
             .unwrap()
             .with_snapshot_id(SNAP_ONLY_Y);
         assert_eq!(column_names(&provider), ["y"]);
-        let provider = SqeTableProvider::try_new(evolved_table(), NotInherited)
+        let provider = SqeTableProvider::try_new(evolved_table(), NotInherited, CatalogNone)
             .await
             .unwrap()
             .with_snapshot_id(999);
@@ -888,6 +911,7 @@ mod scan_statistics_tests {
     use datafusion::prelude::{col, lit, SessionContext};
 
     use super::SqeTableProvider;
+    use crate::catalog_tags::CatalogTagState::NotInherited as CatalogNone;
     use crate::iceberg_scan::IcebergScanExec;
     use crate::schema_tags::SchemaTagState::NotInherited;
     use crate::test_fixtures::{
@@ -912,10 +936,13 @@ mod scan_statistics_tests {
     #[tokio::test]
     async fn scan_attaches_manifest_statistics_to_the_exec() {
         let dir = tempfile::tempdir().unwrap();
-        let provider =
-            SqeTableProvider::try_new(fake_iceberg_table(dir.path(), false).await, NotInherited)
-                .await
-                .unwrap();
+        let provider = SqeTableProvider::try_new(
+            fake_iceberg_table(dir.path(), false).await,
+            NotInherited,
+            CatalogNone,
+        )
+        .await
+        .unwrap();
         let ctx = SessionContext::new();
 
         let plan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
@@ -942,10 +969,13 @@ mod scan_statistics_tests {
     #[tokio::test]
     async fn projected_scan_statistics_follow_the_projection() {
         let dir = tempfile::tempdir().unwrap();
-        let provider =
-            SqeTableProvider::try_new(fake_iceberg_table(dir.path(), false).await, NotInherited)
-                .await
-                .unwrap();
+        let provider = SqeTableProvider::try_new(
+            fake_iceberg_table(dir.path(), false).await,
+            NotInherited,
+            CatalogNone,
+        )
+        .await
+        .unwrap();
         let ctx = SessionContext::new();
 
         let plan = provider
@@ -969,10 +999,13 @@ mod scan_statistics_tests {
     #[tokio::test]
     async fn filtered_scan_degrades_the_row_count_to_inexact() {
         let dir = tempfile::tempdir().unwrap();
-        let provider =
-            SqeTableProvider::try_new(fake_iceberg_table(dir.path(), false).await, NotInherited)
-                .await
-                .unwrap();
+        let provider = SqeTableProvider::try_new(
+            fake_iceberg_table(dir.path(), false).await,
+            NotInherited,
+            CatalogNone,
+        )
+        .await
+        .unwrap();
         let ctx = SessionContext::new();
 
         let plan = provider
@@ -990,10 +1023,13 @@ mod scan_statistics_tests {
     #[tokio::test]
     async fn distinct_count_request_without_puffin_leaves_ndv_absent() {
         let dir = tempfile::tempdir().unwrap();
-        let provider =
-            SqeTableProvider::try_new(fake_iceberg_table(dir.path(), false).await, NotInherited)
-                .await
-                .unwrap();
+        let provider = SqeTableProvider::try_new(
+            fake_iceberg_table(dir.path(), false).await,
+            NotInherited,
+            CatalogNone,
+        )
+        .await
+        .unwrap();
         let ctx = SessionContext::new();
         let requests = [StatisticsRequest::DistinctCount(Arc::new(
             Column::from_name("id"),
@@ -1015,11 +1051,14 @@ mod scan_statistics_tests {
     async fn manifest_walk_is_observed_in_metrics() {
         let dir = tempfile::tempdir().unwrap();
         let metrics = Arc::new(sqe_metrics::MetricsRegistry::new().unwrap());
-        let provider =
-            SqeTableProvider::try_new(fake_iceberg_table(dir.path(), false).await, NotInherited)
-                .await
-                .unwrap()
-                .with_metrics(Arc::clone(&metrics));
+        let provider = SqeTableProvider::try_new(
+            fake_iceberg_table(dir.path(), false).await,
+            NotInherited,
+            CatalogNone,
+        )
+        .await
+        .unwrap()
+        .with_metrics(Arc::clone(&metrics));
         let ctx = SessionContext::new();
 
         provider.scan(&ctx.state(), None, &[], None).await.unwrap();
@@ -1038,9 +1077,10 @@ mod scan_statistics_tests {
     /// failing planning.
     #[tokio::test]
     async fn snapshotless_table_scans_with_unknown_statistics() {
-        let provider = SqeTableProvider::try_new(fake_snapshotless_table(), NotInherited)
-            .await
-            .unwrap();
+        let provider =
+            SqeTableProvider::try_new(fake_snapshotless_table(), NotInherited, CatalogNone)
+                .await
+                .unwrap();
         let ctx = SessionContext::new();
 
         let plan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();

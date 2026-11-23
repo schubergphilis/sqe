@@ -398,4 +398,57 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, SqeError::NotImplemented(_)), "{err:?}");
     }
+
+    /// #924: with the flag off the catalog entity is never requested; on, the
+    /// tags come from it and a refusal is `Unknown` (never an empty list).
+    #[tokio::test]
+    async fn catalog_tag_state_reads_the_entity_only_when_inheriting() {
+        use crate::catalog_tags::CatalogTagState;
+        let server = polaris().await;
+        Mock::given(method("GET"))
+            .and(path("/api/management/v1/catalogs/wh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(entity(
+                1,
+                serde_json::json!({"sqe.catalog-tags": "[\"pii\"]"}),
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let off = session(&server).await;
+        assert!(matches!(
+            off.catalog_tag_state().await,
+            CatalogTagState::NotInherited
+        ));
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path().starts_with("/api/management"))
+                .count(),
+            0,
+            "flag off: no catalog call"
+        );
+
+        let on = session(&server).await.with_inherit_catalog_tags(true);
+        match on.catalog_tag_state().await {
+            CatalogTagState::Known(tags) => assert_eq!(tags.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        server.verify().await;
+
+        let denied = polaris().await;
+        Mock::given(method("GET"))
+            .and(path("/api/management/v1/catalogs/wh"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&denied)
+            .await;
+        let on = session(&denied).await.with_inherit_catalog_tags(true);
+        assert!(matches!(
+            on.catalog_tag_state().await,
+            CatalogTagState::Unknown
+        ));
+    }
 }

@@ -1936,9 +1936,10 @@ impl WriteHandler {
         // same table as `catalog.ns.t` (`TableScope::qualify`), and a
         // catalog-scoped policy store keys on that catalog.
         let catalog_name = self.policy_catalog_name(qualifier.clone(), session);
-        // Inherited schema tags live on the provider, not the cache (#924).
+        // Inherited schema and catalog tags live on the provider, not the
+        // cache (#924).
         let probe: Arc<dyn datafusion::datasource::TableProvider> =
-            if self.config.policy.inherit_schema_tags {
+            if self.config.policy.inherit_schema_tags || self.config.policy.inherit_catalog_tags {
                 let target = resolve_target_catalog(qualifier, session);
                 let session_catalog = self
                     .resolve_session_catalog(session, target.as_deref())
@@ -1947,9 +1948,14 @@ impl WriteHandler {
                 let schema_tags = session_catalog
                     .schema_tag_state(table_ident.namespace())
                     .await;
+                let catalog_tags = session_catalog.catalog_tag_state().await;
                 Arc::new(
-                    sqe_catalog::table_provider::SqeTableProvider::try_new(table, schema_tags)
-                        .await?,
+                    sqe_catalog::table_provider::SqeTableProvider::try_new(
+                        table,
+                        schema_tags,
+                        catalog_tags,
+                    )
+                    .await?,
                 )
             } else {
                 Arc::new(MemTable::try_new(schema, vec![vec![]]).map_err(|e| {
@@ -14906,6 +14912,7 @@ s3_path_style = true
             let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(
                 table,
                 sqe_catalog::schema_tags::SchemaTagState::NotInherited,
+                sqe_catalog::catalog_tags::CatalogTagState::NotInherited,
             )
             .await
             .expect("table provider");
@@ -15380,6 +15387,7 @@ s3_path_style = true
             let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(
                 table,
                 sqe_catalog::schema_tags::SchemaTagState::NotInherited,
+                sqe_catalog::catalog_tags::CatalogTagState::NotInherited,
             )
             .await
             .expect("table provider");

@@ -191,11 +191,15 @@ impl QueryHandler {
         let schema_tags = session_catalog
             .schema_tag_state(&table_ident.namespace)
             .await;
-        let provider =
-            sqe_catalog::table_provider::SqeTableProvider::try_new(iceberg_table, schema_tags)
-                .await?
-                .with_snapshot_id(snapshot_id)
-                .with_prefetch_concurrency(prefetch_concurrency);
+        let catalog_tags = session_catalog.catalog_tag_state().await;
+        let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(
+            iceberg_table,
+            schema_tags,
+            catalog_tags,
+        )
+        .await?
+        .with_snapshot_id(snapshot_id)
+        .with_prefetch_concurrency(prefetch_concurrency);
 
         let alias = format!("__sqe_ver_{}_{}", bare_table, uuid::Uuid::now_v7().simple());
         let qualified = format!("datafusion.public.{alias}");
@@ -279,9 +283,11 @@ impl QueryHandler {
                 let schema_tags = session_catalog
                     .schema_tag_state(&table_ident.namespace)
                     .await;
+                let catalog_tags = session_catalog.catalog_tag_state().await;
                 let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(
                     iceberg_table,
                     schema_tags,
+                    catalog_tags,
                 )
                 .await?
                 .with_snapshot_id(snapshot_id)
@@ -386,9 +392,11 @@ impl QueryHandler {
                 )
             })?;
         let iceberg_table = planned_provider.table().clone();
-        // The planned scan already read the schema tags; the incremental
-        // provider answers the policy rewriter with the same state (#924).
+        // The planned scan already read the schema and catalog tags; the
+        // incremental provider answers the policy rewriter with the same
+        // state (#924).
         let schema_tags = planned_provider.schema_tags().clone();
+        let catalog_tags = planned_provider.catalog_tags().clone();
 
         // Plan the range. `plan_incremental` also calls `resolve_range`
         // internally, so range validation happens once.
@@ -440,6 +448,7 @@ impl QueryHandler {
             iceberg_table.metadata().properties().clone(),
             iceberg_table.metadata().current_schema().clone(),
             schema_tags,
+            catalog_tags,
         );
 
         // Register under a unique alias in the `datafusion.public` schema,

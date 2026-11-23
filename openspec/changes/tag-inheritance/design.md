@@ -70,7 +70,17 @@ There is no namespace cache in this MR: one `get_namespace` per table load, only
 
 `CacheTagSource`, the fallback for a scan whose provider the hook does not recognise, cannot see schema tags; with the flag on it reports the tag state as unknown for an Iceberg table rather than enforce table tags alone.
 
-Effective tags are column, then table, then schema: the nearest key wins (D1 applied twice). Catalog tags stay out: `ALTER CATALOG ... SET TAGS` is refused today, and their inheritance is left to #924.
+Effective tags are column, then table, then schema: the nearest key wins (D1 applied twice). Catalog tags follow in D9.
+
+### D9. Catalog tags: a second flag, the same three states
+
+Catalog tag inheritance ships behind its own flag, `policy.inherit_catalog_tags` (env `SQE_POLICY__INHERIT_CATALOG_TAGS`), default `false` and independent of the schema flag. It mirrors D8: with the flag on, every table load that builds a scan provider reads `sqe.catalog-tags` through `SessionCatalog::catalog_properties()` (one `GET /api/management/v1/catalogs/{name}` with the caller's token) and the provider carries `CatalogTagState`: not inherited (flag off, no catalog call), known, or unknown (403, error, malformed). A catalog that is not Polaris REST (`NotImplemented`) has no catalog tags: known and empty. The constructors take the catalog state as a separate required argument, with no default, so a new call site cannot forget it. The engine-credential read gate checks the same effective tags.
+
+Polaris answers the catalog entity only to a principal holding `CATALOG_READ_PROPERTIES` on the catalog. With the flag on, every principal that reads tables in the catalog needs that privilege; without it the GET is a 403, the state is unknown and the read is refused (fail closed), never unmasked. This is a deployment prerequisite of turning the flag on, and it is tested live.
+
+Freshness: no cache and no memo, the same choice as D8. It costs one management GET per table load with the flag on (a query over N tables makes N identical GETs on the shared HTTP client). A per-session memo would go stale on `ALTER CATALOG ... UNSET TAGS` because session contexts are cached across statements; a cross-token cache is the same eviction problem as D8. Measure before adding either.
+
+Catalog tags are enforced by SQE only. They are not projected to Ranger, and the Ranger tag load observer never sees them, so Spark does not mask on a catalog tag. A catalog attached at runtime with `ATTACH` has no user token for the Polaris catalog entity and carries no catalog tags. `CacheTagSource` reports unknown with the catalog flag on, as it does for schema tags.
 
 ## Risks
 

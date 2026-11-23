@@ -70,3 +70,32 @@ With `policy.inherit_schema_tags = true`, a column's effective tags SHALL also h
 #### Scenario: Schema row filters apply to writes
 - **WHEN** `inherit_schema_tags` is on and a tag row filter `id > 1` matches the schema tag `eu`
 - **THEN** `UPDATE` and `DELETE` on a table in the schema leave the row with id 1 unchanged
+
+### Requirement: Columns inherit their catalog's tags when enabled
+With `policy.inherit_catalog_tags = true`, a column's effective tags SHALL also hold every tag of its catalog whose key neither the column, its table nor its schema carries. The flag SHALL be independent of `policy.inherit_schema_tags`. With the flag off (the default), catalog tags SHALL NOT affect enforcement and SQE SHALL NOT read them when planning a query. Catalog tags SHALL be enforced by SQE only and SHALL NOT be projected to Ranger.
+
+#### Scenario: Flag off ignores catalog tags
+- **WHEN** a tag policy nullifies `pii`, `inherit_catalog_tags` is off and an admin runs `ALTER CATALOG c SET TAGS ('pii')`
+- **THEN** the columns of every table in `c` read their values
+
+#### Scenario: A catalog tag masks every table in the catalog
+- **WHEN** `inherit_catalog_tags` is on, a tag policy nullifies `pii` and `c` carries `pii`
+- **THEN** every column of every table in `c` reads as NULL, including a table created after the tag
+- **AND** a second session that read a table before the tag was set reads NULL on its next statement
+- **AND** after `ALTER CATALOG c UNSET TAGS ('pii')` the columns read their values again
+
+#### Scenario: The catalog flag is independent of the schema flag
+- **WHEN** `inherit_schema_tags` is on, `inherit_catalog_tags` is off and `c` carries `pii`
+- **THEN** the columns of every table in `c` read their values
+
+#### Scenario: The nearest key wins
+- **WHEN** `c` carries `owner = finance` and `c.ns` carries `owner = risk`
+- **THEN** the effective tags of every column of every table in `c.ns` hold `owner = risk` once
+
+#### Scenario: Unreadable catalog tags fail closed
+- **WHEN** `inherit_catalog_tags` is on and `sqe.catalog-tags` on the catalog is malformed, or the caller may not read the catalog properties
+- **THEN** every read of a table in the catalog is refused with "tag state unknown"
+
+#### Scenario: Catalog row filters apply to writes
+- **WHEN** `inherit_catalog_tags` is on and a tag row filter `id > 1` matches the catalog tag `eu`
+- **THEN** `UPDATE` and `DELETE` on a table in the catalog leave the row with id 1 unchanged

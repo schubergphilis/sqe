@@ -126,6 +126,7 @@ impl ReadGate for PolicyReadGate {
         table: &TableIdent,
         loaded: &Table,
         schema_tags: &[sqe_core::column_tags::ColumnTag],
+        catalog_tags: &[sqe_core::column_tags::ColumnTag],
     ) -> sqe_core::Result<bool> {
         // Malformed tags are UNKNOWN, not empty: fail the load, like the
         // rewriter does (never grant keys on a policy that cannot be read).
@@ -134,6 +135,7 @@ impl ReadGate for PolicyReadGate {
             metadata.properties(),
             metadata.current_schema(),
             schema_tags,
+            catalog_tags,
         )
         .map_err(|e| {
             SqeError::Execution(format!(

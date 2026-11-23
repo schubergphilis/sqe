@@ -572,9 +572,15 @@ impl SchemaProvider for BaseTablesOnly {
                 &ident.namespace,
             )
             .await;
-            let provider = crate::table_provider::SqeTableProvider::try_new(table, schema_tags)
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            // An ATTACHed catalog is reached with its own static credentials,
+            // not a user token, so SQE has no way to read the Polaris catalog
+            // entity behind it: it carries no catalog tags (#924). Stated
+            // here, not defaulted, so the provider constructor stays total.
+            let catalog_tags = crate::catalog_tags::CatalogTagState::Known(Vec::new());
+            let provider =
+                crate::table_provider::SqeTableProvider::try_new(table, schema_tags, catalog_tags)
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
             return Ok(Some(Arc::new(provider)));
         }
         if let Some(table) = self.inner.table(name).await? {

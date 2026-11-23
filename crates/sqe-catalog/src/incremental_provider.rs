@@ -56,6 +56,7 @@ use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderB
 use parquet::arrow::ProjectionMask;
 use tracing::debug;
 
+use crate::catalog_tags::CatalogTagState;
 use crate::incremental_scan::{
     attach_meta_columns, augment_schema_with_meta, ChangeKind, IncrementalFile, IncrementalPlan,
     CHANGE_ORDINAL_COLUMN, CHANGE_TYPE_COLUMN, COMMIT_SNAPSHOT_ID_COLUMN,
@@ -94,6 +95,8 @@ pub struct IncrementalTableProvider {
     /// supplied them, and the rewriter treats the scan as not recognised
     /// rather than as untagged.
     schema_tags: Option<SchemaTagState>,
+    /// The tags of the table's catalog, supplied with `schema_tags` (#924).
+    catalog_tags: Option<CatalogTagState>,
 }
 
 impl std::fmt::Debug for IncrementalTableProvider {
@@ -125,24 +128,32 @@ impl IncrementalTableProvider {
             table_properties: None,
             table_schema: None,
             schema_tags: None,
+            catalog_tags: None,
         }
     }
 
     /// Attach the table's properties as loaded for planning (#844), and the
     /// Iceberg schema the scan reads (#920), and the schema's tags read in
-    /// the same step (#924). The schema tags are a required argument so a
-    /// provider with properties can never be mistaken for one in an untagged
-    /// schema.
+    /// the same step (#924), and the catalog's tags. The schema and catalog
+    /// tags are required arguments so a provider with properties can never
+    /// be mistaken for one in an untagged schema or catalog.
     pub fn with_table_properties(
         mut self,
         properties: HashMap<String, String>,
         schema: iceberg::spec::SchemaRef,
         schema_tags: SchemaTagState,
+        catalog_tags: CatalogTagState,
     ) -> Self {
         self.table_properties = Some(properties);
         self.table_schema = Some(schema);
         self.schema_tags = Some(schema_tags);
+        self.catalog_tags = Some(catalog_tags);
         self
+    }
+
+    /// The tags of the table's catalog, if the builder supplied them.
+    pub fn catalog_tags(&self) -> Option<&CatalogTagState> {
+        self.catalog_tags.as_ref()
     }
 
     /// The tags of the table's schema, if the builder supplied them.
