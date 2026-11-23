@@ -567,20 +567,26 @@ enum Lookup {
 }
 
 impl SqeSchemaProvider {
-    /// The scan provider for a loaded table. The schema's tags are read in
-    /// the same step as the table, with the caller's token (#924), and the
-    /// load is reported with them, which projects a tag committed outside
-    /// SQE into Ranger (#903, #935).
+    /// The scan provider for a loaded table. The schema's and the catalog's
+    /// tags are read in the same step as the table, with the caller's token
+    /// (#924), and the load is reported with the schema's, which projects a
+    /// tag committed outside SQE into Ranger (#903, #935).
     async fn table_provider(
         &self,
         table: iceberg::table::Table,
         table_ident: &iceberg::TableIdent,
     ) -> sqe_core::Result<SqeTableProvider> {
         let session = &self.session_catalog;
-        let schema_tags = session.schema_tag_state(table_ident.namespace()).await;
+        // Both reads are independent calls with the caller's token.
+        let (schema_tags, catalog_tags) = tokio::join!(
+            session.schema_tag_state(table_ident.namespace()),
+            session.catalog_tag_state()
+        );
         let catalog = self.catalog_name.as_deref().unwrap_or(&self.warehouse);
+        // Only the schema's tags go to the observer: catalog tags are never
+        // projected to Ranger (#924).
         session.notify_table_loaded(catalog, table_ident, &table, &schema_tags);
-        SqeTableProvider::try_new(table, schema_tags).await
+        SqeTableProvider::try_new(table, schema_tags, catalog_tags).await
     }
 
     /// Load `name` as an Iceberg table, else as an Iceberg view.

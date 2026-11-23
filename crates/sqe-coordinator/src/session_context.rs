@@ -123,6 +123,7 @@ pub(crate) async fn build_catalog_provider(
     prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
     degrade_unresolvable: bool,
     inherit_schema_tags: bool,
+    inherit_catalog_tags: bool,
 ) -> Result<(SqeCatalogProvider, Arc<SessionCatalog>), Arc<SqeError>> {
     let (session_catalog, storage) = build_session_catalog(
         cat_cfg,
@@ -131,6 +132,7 @@ pub(crate) async fn build_catalog_provider(
         global_storage,
         table_cache,
         inherit_schema_tags,
+        inherit_catalog_tags,
     )
     .await?;
 
@@ -175,6 +177,7 @@ pub(crate) async fn build_session_catalog(
     global_storage: &sqe_core::config::StorageConfig,
     table_cache: Option<&TableMetadataCache>,
     inherit_schema_tags: bool,
+    inherit_catalog_tags: bool,
 ) -> Result<(Arc<SessionCatalog>, sqe_core::config::StorageConfig), Arc<SqeError>> {
     session.check_catalog_read(sql_name).map_err(Arc::new)?;
     let auth = cat_cfg.auth.clone().unwrap_or_default();
@@ -191,7 +194,8 @@ pub(crate) async fn build_session_catalog(
             .await
             .map_err(Arc::new)?
             .with_catalog_scope(session.catalog_scope_arc(), sql_name)
-            .with_inherit_schema_tags(inherit_schema_tags);
+            .with_inherit_schema_tags(inherit_schema_tags)
+            .with_inherit_catalog_tags(inherit_catalog_tags);
     // Engine credential identity (#934): reads of this catalog use keys the
     // engine fetches after the policy gate says yes. Built per session, bound
     // to the person; absent policy wiring fails the build, never the gate.
@@ -590,6 +594,7 @@ pub async fn create_session_context(
                     // (#501). It registers empty and self-heals on re-list.
                     true,
                     config.policy.inherit_schema_tags,
+                    config.policy.inherit_catalog_tags,
                 )
                 .await?;
                 if catalog_provider.listing_succeeded() && catalog_auth_is_per_user(cat_cfg) {
@@ -1251,6 +1256,7 @@ pub(crate) async fn discover_catalog_provider(
         // catalog and hijack the session default.
         false,
         config.policy.inherit_schema_tags,
+        config.policy.inherit_catalog_tags,
     )
     .await
     {
@@ -1304,6 +1310,7 @@ pub(crate) async fn configured_session_catalog(
         &config.storage,
         table_cache,
         config.policy.inherit_schema_tags,
+        config.policy.inherit_catalog_tags,
     )
     .await
     {
@@ -1372,6 +1379,7 @@ pub(crate) async fn discover_session_catalog(
         &config.storage,
         table_cache,
         config.policy.inherit_schema_tags,
+        config.policy.inherit_catalog_tags,
     )
     .await
     {

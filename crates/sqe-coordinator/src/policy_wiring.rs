@@ -166,7 +166,8 @@ pub fn build_policy_enforcer_with_engine_catalogs(
                 // (#924).
                 let iceberg: Arc<dyn sqe_policy::TagSource> = Arc::new(
                     crate::tag_source_impl::CacheTagSource::new(Arc::new(cache))
-                        .with_inherit_schema_tags(config.inherit_schema_tags),
+                        .with_inherit_schema_tags(config.inherit_schema_tags)
+                        .with_inherit_catalog_tags(config.inherit_catalog_tags),
                 );
                 // Wrap unconditionally, and let the router read the live
                 // `hive_catalogs` set on every call. Deciding here whether to

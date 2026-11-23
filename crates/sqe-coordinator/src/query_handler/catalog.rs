@@ -4,6 +4,7 @@
 //! `CREATE SECRET` / `DROP SECRET` / `SHOW SECRETS` handlers manage the secret store.
 
 use super::*;
+use sqe_catalog::catalog_tags::CatalogTagState;
 use sqe_catalog::schema_tags::SchemaTagState;
 
 impl QueryHandler {
@@ -117,10 +118,24 @@ impl QueryHandler {
                         ));
                     }
                 };
+                let catalog_tags = match session_catalog.catalog_tag_state().await {
+                    CatalogTagState::NotInherited => Vec::new(),
+                    CatalogTagState::Known(tags) => tags,
+                    CatalogTagState::Unknown => {
+                        return Err(SqeError::with_code(
+                            SqeErrorCode::ExecutionFailed,
+                            format!(
+                                "SHOW STATS: catalog tags of {table_name} could not be read; \
+                                 tag state unknown"
+                            ),
+                        ));
+                    }
+                };
                 let col_tags = crate::tag_source_impl::effective_column_tags(
                     metadata.properties(),
                     metadata.current_schema(),
                     &schema_tags,
+                    &catalog_tags,
                 )
                 .map_err(|e| {
                     SqeError::with_code(

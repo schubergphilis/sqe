@@ -589,6 +589,7 @@ mod tests {
         let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(
             table,
             sqe_catalog::schema_tags::SchemaTagState::NotInherited,
+            sqe_catalog::catalog_tags::CatalogTagState::NotInherited,
         )
         .await
         .unwrap();

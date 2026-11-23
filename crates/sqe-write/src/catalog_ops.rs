@@ -2299,7 +2299,8 @@ impl CatalogOps {
 
     /// The `column -> [tag keys]` map tag policies match on a table, for the
     /// tag-merge step of `SHOW EFFECTIVE POLICY`: each column's own tags plus
-    /// the table's (#924), as enforcement sees them. Loads the table via the
+    /// the table's, the schema's and the catalog's when those are inherited
+    /// (#924), as enforcement sees them. Loads the table via the
     /// caller's token, so the catalog's own read-access enforcement gates the
     /// call (no extra SQE gate needed). Returns an empty map for a table with
     /// no tags.
@@ -2331,10 +2332,16 @@ impl CatalogOps {
                 return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, msg));
             }
         };
+        let Some(catalog_tags) = session_catalog.catalog_tag_state().await.into_tags() else {
+            let msg =
+                format!("catalog tags of '{table_ident}' could not be read: tag state unknown");
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, msg));
+        };
         let tags = crate::tag_source_impl::effective_column_tags(
             metadata.properties(),
             metadata.current_schema(),
             &schema_tags,
+            &catalog_tags,
         )
         .map_err(|e| {
             SqeError::with_code(

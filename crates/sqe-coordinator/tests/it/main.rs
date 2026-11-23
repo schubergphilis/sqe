@@ -34,6 +34,7 @@ mod bound_params_e2e;
 mod catalog_discovery_test;
 mod catalog_scope_e2e;
 mod catalog_scoped_policy_ddl_test;
+mod catalog_tag_inheritance_e2e;
 mod column_tag_ids_e2e;
 mod compaction_benchmark;
 mod compaction_distributed_benchmark;

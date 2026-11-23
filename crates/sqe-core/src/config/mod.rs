@@ -2534,6 +2534,17 @@ pub struct PolicyConfig {
     /// Can be set via the `SQE_POLICY__INHERIT_SCHEMA_TAGS` environment variable.
     #[serde(default)]
     pub inherit_schema_tags: bool,
+    /// A catalog's tags (`ALTER CATALOG ... SET TAGS`) apply to every column
+    /// of every table in it, after the table's and the schema's. Off by
+    /// default: SQE then reads no catalog property when it plans a query. It
+    /// is independent of `inherit_schema_tags`. With it on, a catalog whose
+    /// tags cannot be read (403, error, malformed) refuses every read of its
+    /// tables. Catalog tags are enforced by SQE only; they are not projected
+    /// to Ranger.
+    ///
+    /// Can be set via the `SQE_POLICY__INHERIT_CATALOG_TAGS` environment variable.
+    #[serde(default)]
+    pub inherit_catalog_tags: bool,
 }
 
 /// Resolution order for a column that a resource mask and a tag mask both cover.
@@ -9795,6 +9806,33 @@ warehouse = "wh"
         let from_env = SqeConfig::load_from_str(MINIMAL_TOML);
         std::env::remove_var("SQE_POLICY__INHERIT_SCHEMA_TAGS");
         assert!(from_env.unwrap().policy.inherit_schema_tags, "env override");
+    }
+
+    /// `policy.inherit_catalog_tags`: off by default, settable in TOML and
+    /// through `SQE_POLICY__INHERIT_CATALOG_TAGS`, independent of the schema flag.
+    #[test]
+    fn inherit_catalog_tags_loads_from_toml_and_env() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("SQE_POLICY__INHERIT_CATALOG_TAGS");
+        assert!(!load_with_env().policy.inherit_catalog_tags, "default off");
+
+        let from_toml = SqeConfig::load_from_str(
+            &(MINIMAL_TOML.to_string() + "[policy]\ninherit_catalog_tags = true\n"),
+        )
+        .unwrap();
+        assert!(from_toml.policy.inherit_catalog_tags, "TOML key");
+        assert!(
+            !from_toml.policy.inherit_schema_tags,
+            "schema flag unaffected"
+        );
+
+        std::env::set_var("SQE_POLICY__INHERIT_CATALOG_TAGS", "true");
+        let from_env = SqeConfig::load_from_str(MINIMAL_TOML);
+        std::env::remove_var("SQE_POLICY__INHERIT_CATALOG_TAGS");
+        assert!(
+            from_env.unwrap().policy.inherit_catalog_tags,
+            "env override"
+        );
     }
 
     /// `[policy]` keys take their snake spelling only. A kebab

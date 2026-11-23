@@ -198,6 +198,7 @@ impl SessionCatalog {
             table_cache: self.table_cache.clone(),
             scope_guard: self.scope_guard.clone(),
             inherit_schema_tags: self.inherit_schema_tags,
+            inherit_catalog_tags: self.inherit_catalog_tags,
             engine: None,
             write_inner: None,
             cache_tag: WRITE_CACHE_TAG,
@@ -260,9 +261,14 @@ impl SessionCatalog {
                 )));
             }
         };
+        let Some(catalog_tags) = self.catalog_tag_state().await.into_tags() else {
+            return Err(sqe_core::SqeError::Execution(format!(
+                "engine credentials: catalog tags of {table_ident} could not be read; tag state unknown"
+            )));
+        };
         identity
             .gate
-            .may_read(table_ident, loaded, &schema_tags)
+            .may_read(table_ident, loaded, &schema_tags, &catalog_tags)
             .await
     }
 
@@ -437,6 +443,7 @@ mod tests {
             &self,
             _: &TableIdent,
             _: &Table,
+            _: &[sqe_core::column_tags::ColumnTag],
             _: &[sqe_core::column_tags::ColumnTag],
         ) -> sqe_core::Result<bool> {
             Ok(self.0)

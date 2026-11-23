@@ -4,6 +4,7 @@ pub mod aws_config;
 pub mod backends;
 #[cfg(feature = "rest")]
 pub mod catalog_provider;
+pub mod catalog_tags;
 pub mod column_tag_ids;
 pub mod dynamic_filter_wiring;
 pub mod eliminate_cross_join;

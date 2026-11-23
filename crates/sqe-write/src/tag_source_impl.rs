@@ -69,6 +69,9 @@ pub struct CacheTagSource {
     /// namespace properties, so with the flag on this source cannot know a
     /// table's effective tags and reports them unknown (fail closed).
     inherit_schema_tags: bool,
+    /// `policy.inherit_catalog_tags`: the cache holds no catalog entity
+    /// either, so with this flag on the source reports tags unknown too.
+    inherit_catalog_tags: bool,
 }
 
 impl CacheTagSource {
@@ -77,7 +80,16 @@ impl CacheTagSource {
         Self {
             cache,
             inherit_schema_tags: false,
+            inherit_catalog_tags: false,
         }
+    }
+
+    /// With `policy.inherit_catalog_tags` on, report every table's tag state
+    /// unknown rather than enforce table tags without the catalog's (#924).
+    #[must_use = "with_inherit_catalog_tags consumes self; bind the returned source"]
+    pub fn with_inherit_catalog_tags(mut self, on: bool) -> Self {
+        self.inherit_catalog_tags = on;
+        self
     }
 
     /// With `policy.inherit_schema_tags` on, report every table's tag state
@@ -96,8 +108,8 @@ impl TagSource for CacheTagSource {
         namespace: &[String],
         table: &str,
     ) -> Option<HashMap<String, Vec<String>>> {
-        if self.inherit_schema_tags {
-            debug!(%table, "tag_source: schema tags inherited, tag state UNKNOWN");
+        if self.inherit_schema_tags || self.inherit_catalog_tags {
+            debug!(%table, "tag_source: schema or catalog tags inherited, tag state UNKNOWN");
             return None;
         }
         // Build the namespace display string the same way `table_cache_key` does:
@@ -137,7 +149,7 @@ impl TagSource for CacheTagSource {
         // Entries recorded with a field id resolve against the current schema
         // (#920), so a renamed column keeps its tags. Table tags are
         // inherited by every column (#924).
-        match effective_column_tags(metadata.properties(), metadata.current_schema(), &[]) {
+        match effective_column_tags(metadata.properties(), metadata.current_schema(), &[], &[]) {
             Ok(map) => Some(map),
             Err(e) => {
                 debug!(
@@ -183,13 +195,14 @@ pub fn scan_column_tags(
     // Tags recorded with a field id resolve against the schema the scan
     // reads (the snapshot's under time travel), so a rename applies them
     // under the column's name in that schema (#920).
-    let (properties, schema, schema_tags) = if let Some(iceberg) =
+    let (properties, schema, schema_tags, catalog_tags) = if let Some(iceberg) =
         any.downcast_ref::<sqe_catalog::table_provider::SqeTableProvider>()
     {
         (
             iceberg.table().metadata().properties(),
             iceberg.scan_schema(),
             iceberg.schema_tags(),
+            iceberg.catalog_tags(),
         )
     } else if let Some(incremental) =
         any.downcast_ref::<sqe_catalog::incremental_provider::IncrementalTableProvider>()
@@ -200,9 +213,10 @@ pub fn scan_column_tags(
             incremental.table_properties(),
             incremental.table_schema(),
             incremental.schema_tags(),
+            incremental.catalog_tags(),
         ) {
-            (Some(properties), Some(schema), Some(schema_tags)) => {
-                (properties, schema.clone(), schema_tags)
+            (Some(properties), Some(schema), Some(schema_tags), Some(catalog_tags)) => {
+                (properties, schema.clone(), schema_tags, catalog_tags)
             }
             _ => return ScanTagState::NotRecognised,
         }
@@ -217,7 +231,11 @@ pub fn scan_column_tags(
             return ScanTagState::Unknown;
         }
     };
-    match effective_column_tags(properties, &schema, schema_tags) {
+    let Some(catalog_tags) = catalog_tags.as_tags() else {
+        debug!("tag_source: unreadable catalog tags on the scanned table, tag state UNKNOWN (fail closed)");
+        return ScanTagState::Unknown;
+    };
+    match effective_column_tags(properties, &schema, schema_tags, catalog_tags) {
         Ok(map) => ScanTagState::Known(map),
         Err(e) => {
             debug!(
@@ -274,9 +292,10 @@ pub fn resolved_column_tags(
 /// The tag keys tag policies match on `schema`'s columns: each column's own
 /// ([`resolved_column_tags`]), then the table's `sqe.table-tags`, then
 /// `schema_tags` (the schema's, empty unless `policy.inherit_schema_tags` is
-/// on), each inherited by every top-level column; the nearest key wins
-/// (#924). Malformed table tags are `Err`, like malformed column tags: the
-/// caller fails closed.
+/// on), then `catalog_tags` (the catalog's, empty unless
+/// `policy.inherit_catalog_tags` is on), each inherited by every top-level
+/// column; the nearest key wins (#924). Malformed table tags are `Err`, like
+/// malformed column tags: the caller fails closed.
 ///
 /// This is the enforcement view. Tag writes and their authority compare a
 /// column's own tags ([`applied_column_tag_entries`]), never inherited ones.
@@ -284,16 +303,17 @@ pub fn effective_column_tags(
     props: &HashMap<String, String>,
     schema: &iceberg::spec::Schema,
     schema_tags: &[ColumnTag],
+    catalog_tags: &[ColumnTag],
 ) -> Result<HashMap<String, Vec<String>>, serde_json::Error> {
     let own = applied_column_tag_entries(props, schema)?;
     let table = object_tags::parse(props.get(object_tags::TABLE_PROP_KEY).map(String::as_str))?;
     let columns = || schema.as_struct().fields().iter().map(|f| f.name.as_str());
     let with_table = object_tags::inherit_onto(&own, columns(), &table);
-    // TODO(#924): catalog tags join the chain here, after the schema's.
+    let with_schema = object_tags::inherit_onto(&with_table, columns(), schema_tags);
     Ok(column_tags::keys(&object_tags::inherit_onto(
-        &with_table,
+        &with_schema,
         columns(),
-        schema_tags,
+        catalog_tags,
     )))
 }
 
@@ -1246,6 +1266,7 @@ mod scan_column_tags_tests {
     use super::*;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use iceberg::{Catalog, CatalogBuilder, TableCreation};
+    use sqe_catalog::catalog_tags::CatalogTagState;
     use sqe_catalog::table_provider::SqeTableProvider;
     use sqe_core::column_tags::ids::IDS_PROP_KEY;
     use sqe_policy::plan_rewriter::ScanTagState;
@@ -1272,6 +1293,15 @@ mod scan_column_tags_tests {
     async fn provider_with_schema_tags(
         properties: &[(&str, &str)],
         schema_tags: SchemaTagState,
+    ) -> SqeTableProvider {
+        provider_with_tags(properties, schema_tags, CatalogTagState::NotInherited).await
+    }
+
+    /// [`provider_with`] with the schema and catalog tag states planning read.
+    async fn provider_with_tags(
+        properties: &[(&str, &str)],
+        schema_tags: SchemaTagState,
+        catalog_tags: CatalogTagState,
     ) -> SqeTableProvider {
         let catalog = iceberg::memory::MemoryCatalogBuilder::default()
             .load(
@@ -1302,7 +1332,9 @@ mod scan_column_tags_tests {
             )
             .await
             .unwrap();
-        SqeTableProvider::try_new(table, schema_tags).await.unwrap()
+        SqeTableProvider::try_new(table, schema_tags, catalog_tags)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1452,8 +1484,85 @@ mod scan_column_tags_tests {
         )]
         .into();
         let schema_tags = [ColumnTag::with_value("owner", "finance")];
-        let keys = effective_column_tags(&props, &ssn_schema(), &schema_tags).unwrap();
+        let keys = effective_column_tags(&props, &ssn_schema(), &schema_tags, &[]).unwrap();
         assert_eq!(keys["ssn"], names(&["owner"]));
+    }
+
+    /// The chain is column, table, schema, catalog, and the nearest key wins
+    /// at every step: the catalog's `owner` loses to the schema's, its `pii`
+    /// is added, and a catalog `owner` alone is inherited (#924).
+    #[test]
+    fn effective_tags_chain_ends_at_the_catalog() {
+        let props: HashMap<String, String> = [
+            (PROP_KEY.to_string(), r#"{"ssn":["own"]}"#.to_string()),
+            (
+                object_tags::TABLE_PROP_KEY.to_string(),
+                r#"["tbl"]"#.to_string(),
+            ),
+        ]
+        .into();
+        let schema_tags = [ColumnTag::with_value("owner", "finance")];
+        let catalog_tags = [
+            ColumnTag::with_value("owner", "risk"),
+            ColumnTag::key("pii"),
+            ColumnTag::key("tbl"),
+        ];
+        let keys =
+            effective_column_tags(&props, &ssn_schema(), &schema_tags, &catalog_tags).unwrap();
+        assert_eq!(keys["ssn"], names(&["own", "tbl", "owner", "pii"]));
+        // Catalog tags alone reach a column with no tags of its own.
+        let bare = effective_column_tags(&HashMap::new(), &ssn_schema(), &[], &catalog_tags);
+        assert_eq!(bare.unwrap()["ssn"], names(&["owner", "pii", "tbl"]));
+        // Flag off: no catalog tags, no change.
+        let off = effective_column_tags(&HashMap::new(), &ssn_schema(), &[], &[]).unwrap();
+        assert!(off.is_empty());
+    }
+
+    /// With catalog tags inherited, every column holds them; unreadable
+    /// catalog tags leave the scan unknown; the flag being off adds nothing
+    /// (#924).
+    #[tokio::test]
+    async fn catalog_tags_apply_to_every_column() {
+        let known = CatalogTagState::Known(vec![ColumnTag::key("pii")]);
+        let provider = provider_with_tags(&[], SchemaTagState::NotInherited, known).await;
+        assert_eq!(
+            scan_column_tags(&provider),
+            ScanTagState::Known(HashMap::from([("ssn".to_string(), names(&["pii"]))]))
+        );
+        let off = provider_with_tags(
+            &[],
+            SchemaTagState::NotInherited,
+            CatalogTagState::NotInherited,
+        )
+        .await;
+        assert_eq!(scan_column_tags(&off), ScanTagState::Known(HashMap::new()));
+        let unknown =
+            provider_with_tags(&[], SchemaTagState::NotInherited, CatalogTagState::Unknown).await;
+        assert_eq!(scan_column_tags(&unknown), ScanTagState::Unknown);
+        // Catalog on, schema off is valid: the chain skips the schema.
+        let table_tag = [(object_tags::TABLE_PROP_KEY, r#"["tbl"]"#)];
+        let both = provider_with_tags(
+            &table_tag,
+            SchemaTagState::NotInherited,
+            CatalogTagState::Known(vec![ColumnTag::key("pii")]),
+        )
+        .await;
+        assert_eq!(
+            scan_column_tags(&both),
+            ScanTagState::Known(HashMap::from([("ssn".to_string(), names(&["tbl", "pii"]))]))
+        );
+    }
+
+    /// The fallback cannot see catalog tags either: with that flag on it
+    /// reports every table unknown (#924, D8).
+    #[tokio::test]
+    async fn cache_tag_source_is_unknown_with_catalog_inheritance() {
+        let cache = Arc::new(TableMetadataCache::new(60));
+        let table = provider_with(&[]).await.table().clone();
+        cache.insert("tok|wh|ns.t".to_string(), table).await;
+        let ns = ["ns".to_string()];
+        let on = CacheTagSource::new(cache).with_inherit_catalog_tags(true);
+        assert_eq!(on.column_tags(Some("wh"), &ns, "t"), None);
     }
 
     /// The fallback cannot see schema tags, so with the flag on it reports
@@ -1488,6 +1597,7 @@ mod scan_column_tags_tests {
                     .collect(),
                 Arc::new(ssn_schema()),
                 SchemaTagState::NotInherited,
+                CatalogTagState::NotInherited,
             ),
             None => provider,
         }
