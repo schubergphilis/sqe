@@ -7,7 +7,65 @@
 
 use super::{CatalogAuthConfig, CatalogConfig, PolicyEngine, SqeConfig};
 
+impl CatalogAuthConfig {
+    /// The `client_credentials` secret, or `None` for other variants. With
+    /// `client_secret_file` the file is read on every call, so a rotated file
+    /// is used by the next token request without a restart (#937). Only the
+    /// trailing line break is dropped. An unreadable or empty file is an error
+    /// naming the path, never a fall back to the inline secret.
+    pub fn client_secret_value(&self) -> Result<Option<String>, String> {
+        let CatalogAuthConfig::ClientCredentials {
+            client_secret,
+            client_secret_file,
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        match client_secret_file.as_deref() {
+            None if client_secret.is_empty() => {
+                Err("client_credentials needs client_secret or client_secret_file".to_string())
+            }
+            None => Ok(Some(client_secret.clone())),
+            Some(_) if !client_secret.is_empty() => {
+                Err("set either client_secret or client_secret_file, not both".to_string())
+            }
+            Some(path) => {
+                let raw = std::fs::read_to_string(path)
+                    .map_err(|e| format!("client_secret_file {path}: {e}"))?;
+                let secret = raw.trim_end_matches(['\n', '\r']);
+                if secret.is_empty() {
+                    return Err(format!("client_secret_file {path} is empty"));
+                }
+                Ok(Some(secret.to_string()))
+            }
+        }
+    }
+}
+
 impl SqeConfig {
+    /// Every `client_credentials` block (`auth` and `credentials`, on
+    /// `[catalog]` and each `[catalogs.<name>]`) names exactly one secret
+    /// source, and a `client_secret_file` is readable at boot.
+    fn validate_client_secret_sources(&self, errors: &mut Vec<String>) {
+        let mut blocks: Vec<_> = (self.catalogs.iter())
+            .map(|(n, c)| (format!("[catalogs.{n}]"), c))
+            .collect();
+        blocks.sort_by(|a, b| a.0.cmp(&b.0));
+        blocks.insert(0, ("[catalog]".to_string(), &self.catalog));
+        for (section, catalog) in blocks {
+            for (field, auth) in [
+                ("auth", &catalog.auth),
+                ("credentials", &catalog.credentials),
+            ] {
+                let Some(auth) = auth else { continue };
+                if let Some(problem) = auth.client_secret_value().err() {
+                    errors.push(format!("{section}.{field}: {problem}"));
+                }
+            }
+        }
+    }
+
     /// Names of the catalogs (`[catalog]` is `"default"` only in messages) that
     /// carry an engine credential identity, as `(config section, block)`.
     fn engine_credential_catalogs(&self) -> Vec<(String, &CatalogConfig)> {
@@ -49,6 +107,7 @@ impl SqeConfig {
     /// credentials, a policy backend without default-deny `select`, or Ranger
     /// keys that do not name the catalog.
     pub(super) fn validate_engine_credentials(&self, errors: &mut Vec<String>) {
+        self.validate_client_secret_sources(errors);
         let identities = self.engine_credential_catalogs();
         if identities.is_empty() {
             return;
@@ -99,7 +158,118 @@ mod tests {
             token_endpoint: "http://idp/token".into(),
             client_id: "sqe-engine".into(),
             client_secret: "s".into(),
+            client_secret_file: None,
             scope: None,
+        }
+    }
+
+    /// A file under the temp dir, unique per test, holding `body`.
+    fn secret_file(name: &str, body: &str) -> String {
+        let path = std::env::temp_dir().join(format!("sqe-937-{}-{name}", std::process::id()));
+        std::fs::write(&path, body).expect("write secret file");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn from_file(path: &str) -> CatalogAuthConfig {
+        CatalogAuthConfig::ClientCredentials {
+            token_endpoint: "http://idp/token".into(),
+            client_id: "sqe-engine".into(),
+            client_secret: String::new(),
+            client_secret_file: Some(path.to_string()),
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn secret_file_is_read_on_every_call_and_keeps_inner_text() {
+        let path = secret_file("reread", "old secret\n");
+        let auth = from_file(&path);
+        assert_eq!(auth.client_secret_value(), Ok(Some("old secret".into())));
+        std::fs::write(&path, "new secret\r\n").expect("rotate");
+        assert_eq!(auth.client_secret_value(), Ok(Some("new secret".into())));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unreadable_or_empty_secret_file_is_an_error_naming_the_path() {
+        let missing = from_file("/nonexistent/sqe-937-secret");
+        let err = missing.client_secret_value().expect_err("missing file");
+        assert!(err.contains("/nonexistent/sqe-937-secret"), "{err}");
+        let path = secret_file("empty", "\n");
+        let err = from_file(&path).client_secret_value().expect_err("empty");
+        assert!(err.contains(&path) && err.contains("empty"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn secret_sources_are_exactly_one_in_auth_and_credentials() {
+        let mut cfg = config(None, false, PolicyEngine::Passthrough);
+        let lake = cfg.catalogs.get_mut("lake").expect("lake");
+        lake.auth = Some(CatalogAuthConfig::ClientCredentials {
+            token_endpoint: "http://idp/token".into(),
+            client_id: "partner".into(),
+            client_secret: "inline".into(),
+            client_secret_file: Some("/run/secrets/partner".into()),
+            scope: None,
+        });
+        let errs = errors(&cfg);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("[catalogs.lake].auth") && e.contains("not both")),
+            "{errs:?}"
+        );
+
+        let lake = cfg.catalogs.get_mut("lake").expect("lake");
+        lake.auth = None;
+        // Neither source: an empty inline secret and no file.
+        lake.credentials = Some(CatalogAuthConfig::ClientCredentials {
+            token_endpoint: "http://idp/token".into(),
+            client_id: "sqe-engine".into(),
+            client_secret: String::new(),
+            client_secret_file: None,
+            scope: None,
+        });
+        let errs = errors(&cfg);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("[catalogs.lake].credentials")
+                    && e.contains("needs client_secret or client_secret_file")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn readable_secret_file_passes_startup_and_missing_one_fails() {
+        let path = secret_file("boot", "s3cret");
+        let mut cfg = config(Some(from_file(&path)), true, PolicyEngine::Ranger);
+        assert!(errors(&cfg).is_empty(), "{:?}", errors(&cfg));
+        cfg.catalogs.get_mut("lake").expect("lake").credentials =
+            Some(from_file("/nonexistent/sqe-937-boot"));
+        let errs = errors(&cfg);
+        assert!(
+            errs.iter().any(|e| e.contains("/nonexistent/sqe-937-boot")),
+            "{errs:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn client_secret_file_deserializes_without_inline_secret() {
+        let auth: CatalogAuthConfig = toml::from_str(
+            "type = \"client_credentials\"\ntoken_endpoint = \"http://idp/token\"\n\
+             client_id = \"sqe-engine\"\nclient_secret_file = \"/run/secrets/engine\"\n",
+        )
+        .expect("deserialize");
+        match auth {
+            CatalogAuthConfig::ClientCredentials {
+                client_secret,
+                client_secret_file,
+                ..
+            } => {
+                assert!(client_secret.is_empty());
+                assert_eq!(client_secret_file.as_deref(), Some("/run/secrets/engine"));
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 

@@ -19,3 +19,11 @@
 
 - [x] 2.1 Discovery template drops `credentials`: a discovered warehouse reads with the person's delegated keys, never the engine's (fails closed, like the template's non-per-user `auth`)
 - [x] 2.2 `SqeConfig::engine_read_catalog_names`: the policy store default-denies `select` under each engine catalog's config key and its `warehouse` alias
+
+## 3. Engine secret rotation (#937)
+
+- [x] 3.1 `client_secret_file` on `client_credentials` blocks; exactly-one-source and readable, non-empty file checked at startup for `auth` and `credentials` on every catalog (D10)
+- [x] 3.2 `per_catalog` reads the secret on every resolve; cache key carries the secret fingerprint; rotation reported once per identity and the old entry dropped (D10)
+- [x] 3.3 Engine wiring audits a rotation as `AuditKind::Auth` `engine_secret_rotated` (D10)
+- [x] 3.4 wiremock tests (rotated file sent on the next resolve, unreadable file errors, inline secret one token request); IT on the test stack rotates a principal's secret at Polaris, rewrites the file and keeps reading without a restart
+- [x] 3.5 Docs: catalog operations page, configuration reference, getting-started example

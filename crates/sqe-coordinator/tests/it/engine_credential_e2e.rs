@@ -28,6 +28,7 @@ fn engine_config() -> sqe_core::SqeConfig {
         token_endpoint: config.auth.token_endpoint.clone(),
         client_id: config.auth.client_id.clone(),
         client_secret: config.auth.client_secret.expose().to_string(),
+        client_secret_file: None,
         scope: None,
     });
     config.storage.s3_access_key = String::new();
@@ -38,8 +39,14 @@ fn engine_config() -> sqe_core::SqeConfig {
 async fn engine_handler(
     store: Arc<InMemoryPolicyStore>,
 ) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
+    engine_handler_with(store, engine_config()).await
+}
+
+async fn engine_handler_with(
+    store: Arc<InMemoryPolicyStore>,
+    config: sqe_core::SqeConfig,
+) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
     crate::common::init_tracing();
-    let config = engine_config();
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("Failed to create authenticator");
@@ -268,6 +275,84 @@ async fn engine_credential_read_gate_and_writes() {
         "a refused write leaves no object"
     );
     assert_eq!(count(&check, &session, &select).await, 3, "nothing changed");
+
+    // 6. The engine secret comes from `client_secret_file` and rotates mid
+    //    run (#937): a dedicated read-data principal, its secret rotated at
+    //    Polaris, the file rewritten; the next resolve sends the new secret
+    //    and reports the rotation once, and reads keep working without a
+    //    rebuilt config. A garbage file fails the token request.
+    let rot = "engine_cred_rot";
+    let read_data = [
+        "CATALOG_READ_PROPERTIES",
+        "NAMESPACE_LIST",
+        "NAMESPACE_READ_PROPERTIES",
+        "TABLE_LIST",
+        "TABLE_READ_DATA",
+    ];
+    let (rot_id, first_secret) =
+        crate::dml_write_precheck_e2e::principal_credentials_with(&root, rot, &read_data).await;
+    let secret_file = std::env::temp_dir().join(format!("sqe-937-it-{}", std::process::id()));
+    std::fs::write(&secret_file, format!("{first_secret}\n")).expect("write secret file");
+    let mut rot_config = engine_config();
+    let rot_auth = CatalogAuthConfig::ClientCredentials {
+        token_endpoint: rot_config.auth.token_endpoint.clone(),
+        client_id: rot_id,
+        client_secret: String::new(),
+        client_secret_file: Some(secret_file.to_string_lossy().into_owned()),
+        scope: None,
+    };
+    rot_config.catalog.credentials = Some(rot_auth.clone());
+    let (session, rotating) =
+        engine_handler_with(Arc::new(InMemoryPolicyStore::new()), rot_config).await;
+    assert_eq!(
+        count(&rotating, &session, &select).await,
+        3,
+        "reads with the engine secret from the file"
+    );
+
+    // Polaris lets only the principal itself rotate its secret.
+    let own_token = sqe_auth::per_catalog::resolve_bearer(&rot_auth, "")
+        .await
+        .expect("token from the first secret");
+    let rotated: serde_json::Value = reqwest::Client::new()
+        .post(format!(
+            "{}/management/v1/principals/{rot}/rotate",
+            crate::dml_write_precheck_e2e::POLARIS
+        ))
+        .bearer_auth(&own_token)
+        .send()
+        .await
+        .expect("rotate request")
+        .error_for_status()
+        .expect("secret rotated at Polaris")
+        .json()
+        .await
+        .expect("rotate json");
+    let new_secret = rotated["credentials"]["clientSecret"]
+        .as_str()
+        .expect("new clientSecret")
+        .to_string();
+    assert_ne!(new_secret, first_secret, "Polaris issued a new secret");
+    std::fs::write(&secret_file, format!("{new_secret}\n")).expect("rewrite secret file");
+    let resolved = sqe_auth::per_catalog::resolve_bearer_tracked(&rot_auth, "")
+        .await
+        .expect("the rotated secret mints a token");
+    assert!(resolved.secret_rotated, "the rotation is reported");
+    let again = sqe_auth::per_catalog::resolve_bearer_tracked(&rot_auth, "")
+        .await
+        .expect("cached");
+    assert!(!again.secret_rotated, "reported once per rotation");
+    assert_eq!(
+        count(&rotating, &session, &select).await,
+        3,
+        "reads keep working after the rotation, without a restart"
+    );
+
+    std::fs::write(&secret_file, "not-the-secret\n").expect("garbage secret file");
+    sqe_auth::per_catalog::resolve_bearer(&rot_auth, "")
+        .await
+        .expect_err("a wrong secret in the file fails the token request");
+    let _ = std::fs::remove_file(&secret_file);
 
     let _ = plain
         .execute(&session, &format!("DROP TABLE IF EXISTS {TABLE}"), None)

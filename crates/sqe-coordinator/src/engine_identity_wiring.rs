@@ -29,7 +29,7 @@ use sqe_core::config::{CatalogAuthConfig, MaskPrecedence};
 use sqe_core::session::SessionUser;
 use sqe_core::{Session, SqeError};
 use sqe_metrics::audit::{
-    Actor, AuditEvent, AuditKind, AuditLogger, Integrity, ObjectType, Outcome, Resource,
+    Actor, AuditEvent, AuditKind, AuditLogger, Integrity, ObjectType, Outcome, QueryInfo, Resource,
 };
 use sqe_policy::PolicyStore;
 
@@ -94,6 +94,8 @@ pub(crate) fn engine_identity_for(
     let token = Arc::new(ClientCredentialsToken {
         auth: auth.clone(),
         client_id: client_id.clone(),
+        catalog_name: catalog_name.to_string(),
+        audit: wiring.audit.clone(),
     });
     let gate = Arc::new(PolicyReadGate {
         store: Arc::clone(&wiring.store),
@@ -168,7 +170,12 @@ impl ReadGate for PolicyReadGate {
 struct ClientCredentialsToken {
     auth: CatalogAuthConfig,
     client_id: String,
+    catalog_name: String,
+    audit: Option<Arc<AuditLogger>>,
 }
+
+/// `statement_type` of the audit event for a rotated engine secret (#937).
+const ENGINE_SECRET_ROTATED: &str = "engine_secret_rotated";
 
 #[async_trait]
 impl EngineTokenSource for ClientCredentialsToken {
@@ -178,7 +185,53 @@ impl EngineTokenSource for ClientCredentialsToken {
 
     async fn token(&self) -> sqe_core::Result<String> {
         // No session bearer: the engine token never derives from the person's.
-        sqe_auth::per_catalog::resolve_bearer(&self.auth, "").await
+        let resolved = sqe_auth::per_catalog::resolve_bearer_tracked(&self.auth, "").await?;
+        if resolved.secret_rotated {
+            self.record_rotation();
+        }
+        Ok(resolved.bearer)
+    }
+}
+
+impl ClientCredentialsToken {
+    /// One event when a rotated `client_secret_file` first mints a token.
+    /// The actor is the system, not the person whose read triggered it; the
+    /// event names the catalog and client id, never the secret.
+    fn record_rotation(&self) {
+        let text = format!(
+            "engine client secret rotated: catalog {}, client {}",
+            self.catalog_name, self.client_id
+        );
+        tracing::info!(catalog = %self.catalog_name, client_id = %self.client_id, "{text}");
+        let Some(audit) = self.audit.as_ref() else {
+            return;
+        };
+        let mut actor = Actor::from_parts("system".into(), None, None, vec![], vec![]);
+        actor.app_name = Some(self.client_id.clone());
+        audit.log_event(AuditEvent {
+            time: chrono::Utc::now(),
+            kind: AuditKind::Auth,
+            actor,
+            outcome: Outcome::Success,
+            resources: vec![],
+            policy: None,
+            timing: None,
+            stats: None,
+            query: Some(QueryInfo {
+                query_hash: sqe_metrics::audit::query_hash(&text),
+                text: Some(text),
+                statement_type: ENGINE_SECRET_ROTATED.to_string(),
+                text_len: None,
+                query_fingerprint: None,
+            }),
+            session_id: None,
+            client_ip: None,
+            trace_id: sqe_metrics::propagation::current_trace_id(),
+            query_id: None,
+            transaction: None,
+            session: None,
+            integrity: Integrity::default(),
+        });
     }
 }
 

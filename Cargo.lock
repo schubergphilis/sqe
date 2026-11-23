@@ -6934,6 +6934,7 @@ dependencies = [
  "toml",
  "tracing",
  "url",
+ "wiremock",
  "workspace-hack",
 ]
 

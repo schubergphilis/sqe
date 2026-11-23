@@ -86,3 +86,14 @@ Startup SHALL refuse a `credentials` block whose mode is not `client_credentials
 #### Scenario: Passthrough policy
 - **WHEN** the identity is set and the policy engine is passthrough
 - **THEN** the server does not start and names the setting
+
+### Requirement: Secret rotation without restart
+A `client_credentials` block SHALL take its secret from exactly one of `client_secret` and `client_secret_file`. A secret file SHALL be read on every token request, so a rotated secret is used from the next request on without a restart, and the first token minted with a rotated engine secret SHALL write one audit event that holds no secret material. A wrong or unreadable secret file SHALL fail the token request with no fallback to an earlier secret.
+
+#### Scenario: Secret rotated at the identity provider
+- **WHEN** the operator rotates the engine principal's secret and replaces the secret file
+- **THEN** the next token request sends the new secret, reads keep working, and one `engine_secret_rotated` audit event is written
+
+#### Scenario: Both sources or an unreadable file
+- **WHEN** a block sets both `client_secret` and `client_secret_file`, or the file is missing or empty at startup
+- **THEN** the server does not start and names the block and the file

@@ -1588,6 +1588,7 @@ s3_path_style = true
             client_id: "sqe-engine".into(),
             client_secret: "s".into(),
             scope: None,
+            client_secret_file: None,
         });
         config.catalog.require_vended_credentials = true;
         let template = discovery_template(&config).expect("per-user template still discovers");

@@ -1847,15 +1847,20 @@ pub enum CatalogAuthConfig {
     /// read-only access and other anonymous endpoints.
     Anonymous,
     /// OAuth2 `client_credentials` grant against a per-catalog
-    /// token endpoint. The token is fetched at session-build time
-    /// and reused for the session lifetime; refresh on expiry is
-    /// a future change.
+    /// token endpoint. Tokens are cached until shortly before
+    /// expiry. Exactly one of `client_secret` and
+    /// `client_secret_file` is set (startup check).
     ClientCredentials {
         /// Full URL of the token endpoint (e.g.
         /// `https://partner.com/oauth/tokens`).
         token_endpoint: String,
         client_id: String,
+        #[serde(default)]
         client_secret: String,
+        /// File holding the secret, read on every token resolve, so a
+        /// rotated file takes effect without a restart (#937).
+        #[serde(default)]
+        client_secret_file: Option<String>,
         /// Optional scope passed in the form body. Defaults to
         /// `PRINCIPAL_ROLE:ALL` for Polaris compatibility.
         #[serde(default)]
@@ -7415,6 +7420,7 @@ s3_secret_key = "configured-secret"
             client_id: "svc".to_string(),
             client_secret: "secret".to_string(),
             scope: None,
+            client_secret_file: None,
         });
         let err = config.validate_production().unwrap_err().to_string();
         assert!(err.contains("allow_shared_service_identity"), "got: {err}");
@@ -7987,6 +7993,7 @@ type = "aws"
                 client_id,
                 client_secret,
                 scope,
+                ..
             }) => {
                 assert_eq!(token_endpoint, "https://partner.com/oauth/tokens");
                 assert_eq!(client_id, "sqe-partner");

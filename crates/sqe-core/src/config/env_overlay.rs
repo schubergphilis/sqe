@@ -442,6 +442,15 @@ mod tests {
             env_key_to_path("SQE_METRICS__OPENLINEAGE__ENABLED").as_deref(),
             Some("metrics.openlineage.enabled")
         );
+        // #937: the rotating secret file is set through the generic overlay.
+        assert_eq!(
+            env_key_to_path("SQE_CATALOG__CREDENTIALS__CLIENT_SECRET_FILE").as_deref(),
+            Some("catalog.credentials.client_secret_file")
+        );
+        assert_eq!(
+            env_key_to_path("SQE_CATALOGS__LAKE__CREDENTIALS__CLIENT_SECRET_FILE").as_deref(),
+            Some("catalogs.lake.credentials.client_secret_file")
+        );
         assert_eq!(env_key_to_path("SQE_USER"), None);
         assert_eq!(env_key_to_path("SQE_CONFIG"), None);
         assert_eq!(env_key_to_path("SQE_IT_METADATA_LOCATION"), None);

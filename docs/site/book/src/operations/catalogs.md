@@ -501,8 +501,32 @@ with keys vended to the person's own token, so a person without storage access
 on that warehouse in Polaris cannot read it.
 
 The engine principal is a service account: give it read-only privileges on the
-catalog (`TABLE_READ_DATA`, no write privileges), supply its client secret from
-your secret manager through the environment
-(`SQE_CATALOG__CREDENTIALS__CLIENT_SECRET`), not in the config file, and
-rotate it like any other service credential. SQE reads the secret at startup,
-so a rotation takes a restart.
+catalog (`TABLE_READ_DATA`, no write privileges) and keep its client secret
+out of the config file. Two sources work:
+
+- `client_secret_file` names a file your secret manager mounts. SQE reads it
+  on every token request, so a rotated secret takes effect at the next token
+  without a restart.
+- `SQE_CATALOG__CREDENTIALS__CLIENT_SECRET` sets the secret through the
+  environment. SQE reads it at startup, so a rotation takes a restart.
+
+Set exactly one of `client_secret` and `client_secret_file`; the server does
+not start with both, or with a file it cannot read or that is empty. The same
+rule holds for a `client_credentials` `auth` block.
+
+```toml
+[catalog.credentials]
+type = "client_credentials"
+token_endpoint = "https://polaris.example.com/api/catalog/v1/oauth/tokens"
+client_id = "sqe-engine"
+client_secret_file = "/run/secrets/sqe-engine"
+```
+
+To rotate, issue the new secret at the identity provider first, then replace
+the file in one step (write a temporary file and rename it over the old one),
+so SQE never reads a half-written secret. Tokens already minted with the old
+secret stay valid until they expire. The first token minted with the new
+secret writes an `Auth` audit event with `statement_type`
+`engine_secret_rotated`, naming the catalog and the client id. If the file
+holds a wrong secret, token requests fail and reads on the catalog fail with
+them; SQE never falls back to the old secret.
