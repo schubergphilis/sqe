@@ -439,6 +439,82 @@ impl RangerAdmin {
         Ok(())
     }
 
+    /// Delete the table-level tag resources of `{database}.{table}` from
+    /// `service` (`{database, table}` and `{database, table, column: *}`),
+    /// behind SQE's back: what another coordinator's write looks like to
+    /// this one. Missing resources are not an error.
+    pub async fn delete_table_level_tags(
+        &self,
+        service: &str,
+        database: &str,
+        table: &str,
+    ) -> anyhow::Result<()> {
+        let elements = |column: bool| {
+            let mut e = serde_json::json!({
+                "database": {"values": [database]},
+                "table": {"values": [table]},
+            });
+            if column {
+                e["column"] = serde_json::json!({"values": ["*"]});
+            }
+            e
+        };
+        let body = serde_json::json!({
+            "op": "delete",
+            "serviceName": service,
+            "tagVersion": 1,
+            "tagDefinitions": {"0": {"id": 0, "name": "any", "source": "sqe"}},
+            "tags": {"0": {"id": 0, "type": "any"}},
+            "serviceResources": [
+                {"id": 0, "serviceName": service, "resourceElements": elements(true)},
+                {"id": 1, "serviceName": service, "resourceElements": elements(false)},
+            ],
+            "resourceToTagIds": {"0": [0], "1": [0]},
+        });
+        let resp = self
+            .req(reqwest::Method::PUT, "/service/tags/importservicetags")
+            .json(&body)
+            .send()
+            .await
+            .context("PUT importservicetags delete")?;
+        if !resp.status().is_success() {
+            bail!("delete tag resources -> HTTP {}", resp.status());
+        }
+        Ok(())
+    }
+
+    /// The tag types on the table-level resources of `{database}.{table}` in
+    /// `service`'s tag bundle.
+    pub async fn table_level_tags(
+        &self,
+        service: &str,
+        database: &str,
+        table: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let doc = self.download_tag_bundle(service).await?;
+        let mut out: Vec<String> = Vec::new();
+        for r in doc["serviceResources"].as_array().into_iter().flatten() {
+            let e = &r["resourceElements"];
+            let is = |k: &str, v: &str| e[k]["values"] == serde_json::json!([v]);
+            let column_ok = e.get("column").is_none() || is("column", "*");
+            if !(is("database", database) && is("table", table) && column_ok) {
+                continue;
+            }
+            let id = r["id"].to_string();
+            for tag in doc["resourceToTagIds"][&id]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let name = doc["tags"][tag.to_string()]["type"].as_str().unwrap_or("");
+                if !name.is_empty() && !out.iter().any(|t| t == name) {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Ranger's tag bundle for a resource service, the same document its plugins
     /// download.
     pub async fn download_tag_bundle(&self, service: &str) -> anyhow::Result<Value> {

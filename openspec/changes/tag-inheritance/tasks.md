@@ -19,4 +19,5 @@
 
 - [x] 3.1 Ranger tag projection of table tags, for Spark parity (D5, #935 part 1): DDL, `reproject_column_tags` and the tag load observer; never shrink on a malformed value
 - [x] 3.1b Ranger tag projection of schema tags (#935 part 2): `ALTER SCHEMA`, `reproject_column_tags` and the tag load observer on the schema-wide resource; never shrink on an unreadable schema
+- [x] 3.1c Projection follow-ups (#935): read held tags back from Ranger (memory TTL 120 s schema, 300 s table), delete the schema-wide resource on `DROP SCHEMA` and in the repair with the flag off, one replace per changed column, `sqe_tag_projection_failures_total`
 - [x] 3.2 Ranger e2e: `spark_mask_parity_e2e::table_tag_masks_every_column_in_both_engines` (tag mask and tag row filter on a table tag, both engines) and `schema_tags_mask_and_filter_every_table_in_both_engines` (the same on a schema tag, plus the repair)

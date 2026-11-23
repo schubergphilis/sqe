@@ -12,6 +12,12 @@
 //! tag removed while the coordinator was down stays in Ranger until
 //! `CALL system.reproject_column_tags` repairs it.
 //!
+//! The memory only saves work while it is fresh ([`TABLE_MEMORY_TTL`],
+//! [`SCHEMA_MEMORY_TTL`]). Another coordinator, or an edit in Ranger's UI,
+//! can change what Ranger holds behind it, so an expired entry is not
+//! trusted: a table's tags are sent again as a replace, and a schema's are
+//! read back from Ranger before a write is skipped.
+//!
 //! The table's own tags (`sqe.table-tags`) go the same way, onto the
 //! table-level Ranger resource (#935). When they cannot be read, the
 //! table-level resource keeps what was last projected: Spark masks only
@@ -22,8 +28,10 @@
 //! schema-wide resource (`table:*`, #935), which Ranger applies to every
 //! table and column of the schema. From a load this only ever grows: a key
 //! the schema carries that Ranger does not hold yet is added, and nothing is
-//! removed. An unreadable schema keeps what was projected. `ALTER SCHEMA ...
-//! SET TAGS` and `CALL system.reproject_column_tags` are what shrink it.
+//! removed. Whether Ranger holds a key is read back from Ranger unless a
+//! fresh memory already says so; an unreadable Ranger or schema writes
+//! nothing and keeps what was projected. `ALTER SCHEMA ... SET TAGS`,
+//! `DROP SCHEMA` and `CALL system.reproject_column_tags` are what shrink it.
 //!
 //! The projector writes to Ranger with the coordinator's Ranger credentials,
 //! on behalf of whoever committed the tag to Polaris. That client could
@@ -31,14 +39,25 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use iceberg::table::Table;
 use iceberg::TableIdent;
 use sqe_catalog::load_observer::TableLoadObserver;
 use sqe_catalog::schema_tags::SchemaTagState;
 use sqe_policy::tag_projector::{
-    project_table_level_tags, project_table_tags, ColumnTags, TagProjector,
+    held_table_level_tags, project_table_level_tags, project_table_tags, ColumnTags, TagProjector,
 };
+
+/// How long a table's remembered projection is trusted. After it a load
+/// sends the table's tags again, as a replace, in case Ranger was changed
+/// behind this process.
+pub(crate) const TABLE_MEMORY_TTL: Duration = Duration::from_secs(300);
+
+/// How long a schema's remembered projection is trusted. After it a load
+/// reads Ranger before it skips a write: the memory may hold a key another
+/// coordinator has since removed from Ranger.
+pub(crate) const SCHEMA_MEMORY_TTL: Duration = Duration::from_secs(120);
 
 use crate::catalog_ops::{keyed_lock, TableLockMap};
 
@@ -50,6 +69,13 @@ struct Projected {
     tags: ColumnTags,
     /// The table's own tag keys on the table-level resource (#935).
     table_tags: Vec<String>,
+    at: Instant,
+}
+
+impl Projected {
+    fn fresh(&self) -> bool {
+        self.at.elapsed() < TABLE_MEMORY_TTL
+    }
 }
 
 /// What the observer last projected, per `{catalog}|{ns}.{table}`, and the
@@ -63,8 +89,11 @@ struct Projected {
 #[derive(Clone, Default)]
 pub(crate) struct TagLoadMemory {
     tables: Arc<Mutex<HashMap<String, Projected>>>,
-    schemas: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    schemas: Arc<Mutex<HashMap<String, SchemaHeld>>>,
 }
+
+/// A schema-wide resource's tag keys, and when they were written or read.
+type SchemaHeld = (Vec<String>, Instant);
 
 /// The [`TagLoadMemory`] key of a schema's schema-wide resource.
 pub(crate) fn schema_key(catalog: &str, namespace: &iceberg::NamespaceIdent) -> String {
@@ -82,16 +111,36 @@ impl TagLoadMemory {
         self.tables.lock().expect("projected tags mutex poisoned")
     }
 
-    /// The schema tag keys Ranger is known to hold under `key`.
-    pub(crate) fn schema_held(&self, key: &str) -> Vec<String> {
+    /// The schema tag keys Ranger held under `key` when this process last
+    /// wrote or read them, while that is fresh ([`SCHEMA_MEMORY_TTL`]);
+    /// `None` when unknown or expired.
+    pub(crate) fn schema_held(&self, key: &str) -> Option<Vec<String>> {
         let schemas = self.schemas.lock().expect("projected tags mutex poisoned");
-        schemas.get(key).cloned().unwrap_or_default()
+        schemas
+            .get(key)
+            .filter(|(_, at)| at.elapsed() < SCHEMA_MEMORY_TTL)
+            .map(|(tags, _)| tags.clone())
     }
 
     /// Record what Ranger now holds under `key`.
     pub(crate) fn record_schema(&self, key: String, tags: Vec<String>) {
         let mut schemas = self.schemas.lock().expect("projected tags mutex poisoned");
-        schemas.insert(key, tags);
+        schemas.insert(key, (tags, Instant::now()));
+    }
+
+    /// Drop what was remembered for the schema-wide resource under `key`.
+    pub(crate) fn forget_schema(&self, key: &str) {
+        let mut schemas = self.schemas.lock().expect("projected tags mutex poisoned");
+        schemas.remove(key);
+    }
+
+    /// Age every entry by `by`, as if that much time had passed.
+    #[cfg(test)]
+    pub(crate) fn age(&self, by: Duration) {
+        let back = |at: &mut Instant| *at = at.checked_sub(by).expect("clock too young to age");
+        self.lock().values_mut().for_each(|p| back(&mut p.at));
+        let mut schemas = self.schemas.lock().expect("projected tags mutex poisoned");
+        schemas.values_mut().for_each(|(_, at)| back(at));
     }
 
     /// Drop what was projected for `ident` in every catalog, so its next
@@ -125,6 +174,7 @@ pub struct TagLoadObserver {
     /// interleaves with `SET TAG`'s own.
     table_locks: TableLockMap,
     projected: TagLoadMemory,
+    metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
 }
 
 impl TagLoadObserver {
@@ -139,12 +189,33 @@ impl TagLoadObserver {
             catalog_scoped,
             table_locks,
             projected,
+            metrics: None,
+        }
+    }
+
+    /// Count tags that could not be read on load in
+    /// `sqe_tag_projection_failures_total{op="source"}`.
+    pub(crate) fn with_metrics(
+        mut self,
+        metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
+    ) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    fn count_unreadable(&self) {
+        if let Some(m) = &self.metrics {
+            m.tag_projection_failures_total
+                .with_label_values(&["source"])
+                .inc();
         }
     }
 
     fn is_current(&self, key: &str, location: &str) -> bool {
         let projected = self.projected.lock();
-        projected.get(key).is_some_and(|p| p.location == location)
+        projected
+            .get(key)
+            .is_some_and(|p| p.location == location && p.fresh())
     }
 
     /// Bring Ranger in line with one observation. Serialised per table; an
@@ -157,19 +228,18 @@ impl TagLoadObserver {
         let previous = {
             let projected = self.projected.lock();
             match projected.get(&obs.key) {
-                Some(p)
-                    if p.location == obs.location || p.last_updated_ms > obs.last_updated_ms =>
-                {
-                    return;
-                }
-                Some(p) => (p.tags.clone(), p.table_tags.clone()),
-                None => (ColumnTags::new(), Vec::new()),
+                Some(p) if p.last_updated_ms > obs.last_updated_ms => return,
+                Some(p) if p.location == obs.location && p.fresh() => return,
+                // An expired memory is a guess: send the tags again.
+                Some(p) => (p.tags.clone(), p.table_tags.clone(), !p.fresh()),
+                None => (ColumnTags::new(), Vec::new(), false),
             }
         };
-        let (previous, previous_table) = previous;
+        let (previous, previous_table, refresh) = previous;
         let (ns, name) = (obs.ident.namespace().as_ref(), obs.ident.name());
-        // A data commit leaves the tags alone; nothing to send.
-        if previous != obs.tags {
+        // A data commit leaves the tags alone; nothing to send while the
+        // memory of what Ranger holds is fresh.
+        if refresh || previous != obs.tags {
             let (prev, tags, scoped) = (&previous, &obs.tags, self.catalog_scoped);
             let projector = self.projector.as_ref();
             let done = project_table_tags(projector, &obs.catalog, ns, name, scoped, prev, tags);
@@ -192,18 +262,15 @@ impl TagLoadObserver {
                     "malformed sqe.table-tags; the table-level tags last projected into \
                      Ranger are kept as they are, and a change to them is not projected"
                 );
+                self.count_unreadable();
                 previous_table
             }
-            Some(now) if now == previous_table => now,
+            Some(now) if now == previous_table && !refresh => now,
+            Some(now) if now.is_empty() && previous_table.is_empty() => now,
             Some(now) => {
-                // Ranger's add-or-update replaces a resource's tag set, so a
-                // non-empty set is sent alone: a delete first would leave the
-                // table unmasked between the two calls.
-                let prev = if now.is_empty() {
-                    &previous_table[..]
-                } else {
-                    &[]
-                };
+                // A non-empty set replaces what the resource holds; an empty
+                // one deletes what `previous_table` says was projected.
+                let prev = &previous_table[..];
                 let scoped = self.catalog_scoped;
                 let projector = self.projector.as_ref();
                 let done =
@@ -225,13 +292,16 @@ impl TagLoadObserver {
             last_updated_ms: obs.last_updated_ms,
             tags: obs.tags,
             table_tags,
+            at: Instant::now(),
         };
         self.projected.lock().insert(obs.key, state);
     }
 
     /// Add the schema tag keys in `now` that Ranger does not hold yet to the
-    /// schema-wide resource. Never removes one: the set sent is what is held
-    /// plus `now`, as one replace. Serialised with `ALTER SCHEMA`'s own.
+    /// schema-wide resource. Never removes one: the set sent is what Ranger
+    /// holds plus `now`, as one replace. What Ranger holds is read back from
+    /// it unless a fresh memory already covers `now`; when it cannot be read,
+    /// nothing is written. Serialised with `ALTER SCHEMA`'s own.
     async fn converge_schema(
         &self,
         catalog: String,
@@ -241,12 +311,33 @@ impl TagLoadObserver {
         let lock = keyed_lock(&self.table_locks, schema_lock_key(&catalog, &ns));
         let _guard = lock.lock().await;
         let key = schema_key(&catalog, &ns);
-        let held = self.projected.schema_held(&key);
-        let want = crate::catalog_ops::object_tags::union(&held, &now);
-        if want.len() == held.len() {
+        let covered = |held: &[String]| now.iter().all(|k| held.contains(k));
+        if self
+            .projected
+            .schema_held(&key)
+            .is_some_and(|h| covered(&h))
+        {
             return;
         }
         let (projector, scoped) = (self.projector.as_ref(), self.catalog_scoped);
+        let held = match held_table_level_tags(projector, &catalog, ns.as_ref(), "*", scoped).await
+        {
+            Ok(held) => held,
+            Err(e) => {
+                tracing::error!(
+                    schema = %ns.to_url_string(),
+                    error = %e,
+                    "cannot read the schema tags Ranger holds; nothing is written, and a \
+                     schema tag Ranger lacks reaches other engines on a later load"
+                );
+                return;
+            }
+        };
+        let want = crate::catalog_ops::object_tags::union(&held, &now);
+        if covered(&held) {
+            self.projected.record_schema(key, held);
+            return;
+        }
         let done =
             project_table_level_tags(projector, &catalog, ns.as_ref(), "*", scoped, &[], &want);
         match done.await {
@@ -277,12 +368,17 @@ impl TagLoadObserver {
                     "cannot read the schema's tags; the schema tags last projected into \
                      Ranger are kept as they are, and a change to them is not projected"
                 );
+                self.count_unreadable();
                 return None;
             }
             SchemaTagState::Known(tags) => tags.iter().map(|t| t.key.clone()).collect(),
         };
+        if now.is_empty() {
+            return None;
+        }
         let held = self.projected.schema_held(&schema_key(catalog, ns));
-        (!now.iter().all(|k| held.contains(k))).then_some(now)
+        let covered = held.is_some_and(|h| now.iter().all(|k| h.contains(k)));
+        (!covered).then_some(now)
     }
 }
 
@@ -313,6 +409,7 @@ impl TableLoadObserver for TagLoadObserver {
             Ok(tags) => tags.into_iter().collect(),
             Err(e) => {
                 tracing::warn!(table = %ident, error = %e, "malformed sqe.column-tags; not projected");
+                self.count_unreadable();
                 return;
             }
         };
@@ -343,11 +440,18 @@ mod tests {
     /// (table, previous, tags) per table-level call.
     type TableCalls = Vec<(String, Vec<String>, Vec<String>)>;
 
+    /// Records every call, and keeps a tag store for the table-level
+    /// resources with the semantics probed on Ranger 2.8: a non-empty set
+    /// replaces, an empty one with a `previous` deletes. Two observers on one
+    /// `Recording` are two coordinators on one Ranger.
     #[derive(Default)]
     struct Recording {
         calls: Mutex<Calls>,
         table_calls: Mutex<TableCalls>,
+        store: Mutex<HashMap<String, Vec<String>>>,
         fail: std::sync::atomic::AtomicBool,
+        fail_read: std::sync::atomic::AtomicBool,
+        reads: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -383,11 +487,47 @@ mod tests {
             }
             let call = (table.table.clone(), previous.to_vec(), tags.to_vec());
             self.table_calls.lock().unwrap().push(call);
+            let key = format!("{}|{}", table.database, table.table);
+            let mut store = self.store.lock().unwrap();
+            if !tags.is_empty() {
+                store.insert(key, tags.to_vec());
+            } else if !previous.is_empty() {
+                store.remove(&key);
+            }
             Ok(())
+        }
+
+        async fn held_table_level(&self, table: &TagTableKey) -> sqe_core::Result<Vec<String>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_read.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    "ranger unreadable",
+                ));
+            }
+            let key = format!("{}|{}", table.database, table.table);
+            Ok(self
+                .store
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .unwrap_or_default())
         }
 
         fn enabled(&self) -> bool {
             true
+        }
+    }
+
+    impl Recording {
+        fn held(&self, key: &str) -> Vec<String> {
+            self.store
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .unwrap_or_default()
         }
     }
 
@@ -540,7 +680,8 @@ mod tests {
             ("*".to_string(), vec![], strings(&["pii", "eu"])),
         ];
         assert_eq!(table_calls(&rec), want, "never a delete, never a shrink");
-        assert_eq!(o.projected.schema_held("cat|ns"), strings(&["pii", "eu"]));
+        let held = o.projected.schema_held("cat|ns");
+        assert_eq!(held, Some(strings(&["pii", "eu"])));
     }
 
     #[tokio::test]
@@ -553,7 +694,8 @@ mod tests {
         assert!(o.schema_change("cat", &ns, &schema(&[])).is_none());
         o.converge_schema("cat".into(), ns, strings(&["pii"])).await;
         assert!(table_calls(&rec).is_empty());
-        assert_eq!(o.projected.schema_held("cat|ns"), strings(&["pii", "eu"]));
+        let held = o.projected.schema_held("cat|ns");
+        assert_eq!(held, Some(strings(&["pii", "eu"])));
     }
 
     #[tokio::test]
@@ -577,7 +719,7 @@ mod tests {
         assert!(o
             .schema_change("cat", &ns, &SchemaTagState::Unknown)
             .is_none());
-        assert_eq!(o.projected.schema_held("cat|ns"), strings(&["pii"]));
+        assert_eq!(o.projected.schema_held("cat|ns"), Some(strings(&["pii"])));
 
         o.converge(with_table_tags(
             obs("m1", 1, &[("ssn", "PII")]),
@@ -640,10 +782,148 @@ mod tests {
         ))
         .await;
         let last = table_calls(&rec).pop().unwrap();
-        assert!(
-            last.1.is_empty(),
-            "a non-empty list is one replace, no delete"
+        assert_eq!(
+            last.1,
+            vec!["pii".to_string()],
+            "replaced from what was held"
         );
         assert_eq!(last.2, vec!["pii".to_string(), "gold".to_string()]);
+        assert_eq!(
+            rec.held("ns|t"),
+            vec!["pii".to_string(), "gold".to_string()]
+        );
+    }
+
+    /// #935, the fail-open this guards against: coordinator B remembers the
+    /// schema-wide resource holding `pii`, coordinator A has since removed it
+    /// from Ranger, and the schema carries `pii` again. Once B's memory has
+    /// expired, B reads Ranger rather than trust it, and writes `pii` back.
+    #[tokio::test]
+    async fn an_expired_memory_is_checked_against_ranger_before_a_skip() {
+        let rec = Arc::new(Recording::default());
+        let locks: TableLockMap = Arc::new(Mutex::new(HashMap::new()));
+        let a = TagLoadObserver::new(rec.clone(), false, locks.clone(), TagLoadMemory::default());
+        let b = TagLoadObserver::new(rec.clone(), false, locks, TagLoadMemory::default());
+        let ns = NamespaceIdent::new("ns".into());
+
+        let now = b.schema_change("cat", &ns, &schema(&["pii"])).unwrap();
+        b.converge_schema("cat".into(), ns.clone(), now).await;
+        assert_eq!(rec.held("ns|*"), strings(&["pii"]));
+
+        // A unsets pii: Ranger no longer holds it; B's memory still says so.
+        let pii = strings(&["pii"]);
+        let unset =
+            project_table_level_tags(rec.as_ref(), "cat", ns.as_ref(), "*", false, &pii, &[]);
+        unset.await.unwrap();
+        assert!(rec.held("ns|*").is_empty());
+        drop(a);
+
+        assert!(
+            b.schema_change("cat", &ns, &schema(&["pii"])).is_none(),
+            "a fresh memory skips: the window the TTL bounds"
+        );
+        b.projected.age(SCHEMA_MEMORY_TTL);
+        let now = b.schema_change("cat", &ns, &schema(&["pii"])).unwrap();
+        b.converge_schema("cat".into(), ns.clone(), now).await;
+        assert_eq!(rec.held("ns|*"), strings(&["pii"]), "pii is masked again");
+    }
+
+    /// #935: a key Ranger already holds (another coordinator wrote it) is
+    /// recorded from the read, not written again; and the read never shrinks
+    /// what Ranger holds.
+    #[tokio::test]
+    async fn a_key_ranger_holds_is_recorded_not_written() {
+        let (rec, o) = setup();
+        rec.store
+            .lock()
+            .unwrap()
+            .insert("ns|*".into(), strings(&["pii", "eu"]));
+        let ns = NamespaceIdent::new("ns".into());
+        let now = o.schema_change("cat", &ns, &schema(&["pii"])).unwrap();
+        o.converge_schema("cat".into(), ns.clone(), now).await;
+        assert!(table_calls(&rec).is_empty(), "nothing written");
+        assert_eq!(
+            o.projected.schema_held("cat|ns"),
+            Some(strings(&["pii", "eu"]))
+        );
+
+        let now = o.schema_change("cat", &ns, &schema(&["gold"])).unwrap();
+        o.converge_schema("cat".into(), ns, now).await;
+        assert_eq!(rec.held("ns|*"), strings(&["pii", "eu", "gold"]));
+    }
+
+    /// #935, fail closed: when Ranger cannot be read, nothing is written and
+    /// nothing is remembered, so the next load tries again.
+    #[tokio::test]
+    async fn an_unreadable_ranger_writes_nothing() {
+        let (rec, o) = setup();
+        rec.fail_read
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ns = NamespaceIdent::new("ns".into());
+        let now = o.schema_change("cat", &ns, &schema(&["pii"])).unwrap();
+        o.converge_schema("cat".into(), ns.clone(), now).await;
+        assert!(table_calls(&rec).is_empty());
+        assert_eq!(o.projected.schema_held("cat|ns"), None);
+
+        rec.fail_read
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let now = o.schema_change("cat", &ns, &schema(&["pii"])).unwrap();
+        o.converge_schema("cat".into(), ns, now).await;
+        assert_eq!(rec.held("ns|*"), strings(&["pii"]));
+    }
+
+    /// Loads that queue behind one expired schema read Ranger once: the
+    /// first records what it read, the rest find a fresh memory.
+    #[tokio::test]
+    async fn queued_loads_read_ranger_once() {
+        let (rec, o) = setup();
+        let ns = NamespaceIdent::new("ns".into());
+        for _ in 0..3 {
+            o.converge_schema("cat".into(), ns.clone(), strings(&["pii"]))
+                .await;
+        }
+        assert_eq!(rec.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(table_calls(&rec).len(), 1);
+    }
+
+    /// #935: a table whose memory has expired is sent again as a replace,
+    /// though neither its metadata nor its tags changed, in case Ranger was
+    /// changed behind this process. Fresh, the same load sends nothing.
+    #[tokio::test]
+    async fn an_expired_table_memory_is_sent_again() {
+        let (rec, o) = setup();
+        let tagged = || with_table_tags(obs("m1", 1, &[("ssn", "PII")]), Some(&["gold"]));
+        o.converge(tagged()).await;
+        o.converge(tagged()).await;
+        assert_eq!((calls(&rec).len(), table_calls(&rec).len()), (1, 1));
+        assert!(o.is_current("cat|ns.t", "m1"));
+
+        o.projected.age(TABLE_MEMORY_TTL);
+        assert!(
+            !o.is_current("cat|ns.t", "m1"),
+            "an expired memory is not current"
+        );
+        o.converge(tagged()).await;
+        assert_eq!((calls(&rec).len(), table_calls(&rec).len()), (2, 2));
+        assert_eq!(calls(&rec)[1].2, calls(&rec)[0].2, "the same tags again");
+    }
+
+    /// Unreadable tags on load count in
+    /// `sqe_tag_projection_failures_total{op="source"}`.
+    #[tokio::test]
+    async fn unreadable_tags_are_counted() {
+        let (_, o) = setup();
+        let metrics = Arc::new(sqe_metrics::MetricsRegistry::new().unwrap());
+        let o = o.with_metrics(Some(metrics.clone()));
+        let ns = NamespaceIdent::new("ns".into());
+        assert!(o
+            .schema_change("cat", &ns, &SchemaTagState::Unknown)
+            .is_none());
+        o.converge(with_table_tags(obs("m1", 1, &[]), None)).await;
+        let n = metrics
+            .tag_projection_failures_total
+            .with_label_values(&["source"])
+            .get();
+        assert_eq!(n, 2);
     }
 }

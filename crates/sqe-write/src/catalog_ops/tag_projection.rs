@@ -144,6 +144,20 @@ impl CatalogOps {
         project_table_level_tags(projector, catalog, ns, "*", scoped, previous, tags).await
     }
 
+    /// The tag keys Ranger holds on a schema's schema-wide resource now, read
+    /// back rather than taken from this process's memory: another coordinator
+    /// may have changed it (#935).
+    pub(super) async fn held_schema_keys(
+        &self,
+        catalog: &str,
+        namespace: &iceberg::NamespaceIdent,
+    ) -> sqe_core::Result<Vec<String>> {
+        use sqe_policy::tag_projector::held_table_level_tags;
+        let (ns, scoped) = (namespace.as_ref(), self.catalog_scoped());
+        let projector = self.tag_projector.as_ref();
+        held_table_level_tags(projector, catalog, ns, "*", scoped).await
+    }
+
     /// Project `tags` (columns and table level) onto `ident`, which has none
     /// in Ranger yet: the destination of a rename (#928, #935).
     pub(super) async fn project_ddl_tags(
@@ -389,12 +403,15 @@ impl CatalogOps {
         let mut columns = Vec::with_capacity(targets.len());
         let mut messages = Vec::with_capacity(targets.len());
 
+        // Every schema in scope, also with `inherit_schema_tags` off: then
+        // the schema-wide resource a run with it on left behind is removed.
         let mut schemas: Vec<iceberg::NamespaceIdent> = Vec::new();
-        if self.config.policy.inherit_schema_tags {
-            for ident in &targets {
-                if !schemas.contains(ident.namespace()) {
-                    schemas.push(ident.namespace().clone());
-                }
+        if let ReprojectScope::Namespace(ns) = scope {
+            schemas.push(nested_namespace(ns.namespace_parts()));
+        }
+        for ident in &targets {
+            if !schemas.contains(ident.namespace()) {
+                schemas.push(ident.namespace().clone());
             }
         }
         for ns in &schemas {
@@ -443,8 +460,9 @@ impl CatalogOps {
     }
 
     /// Make the schema-wide resource of `ns` hold exactly the schema's tags
-    /// (#935). An unreadable schema is an error row and Ranger keeps what it
-    /// holds; the row is named `{ns}.*`.
+    /// (#935), or nothing when `inherit_schema_tags` is off. An unreadable
+    /// schema or Ranger is an error row and Ranger keeps what it holds; the
+    /// row is named `{ns}.*`.
     async fn reproject_one_schema(
         &self,
         session_catalog: &SessionCatalog,
@@ -456,26 +474,45 @@ impl CatalogOps {
         let name = format!("{}.*", ns.to_url_string());
         let lock = keyed_lock(&self.table_locks, schema_lock_key(catalog, ns));
         let _guard = lock.lock().await;
-        let props = match session_catalog.get_namespace(ns).await {
-            Ok(n) => n.properties().clone(),
-            Err(e) => return ReprojectRow::error(name, format!("get_namespace failed: {e}")),
-        };
-        let tags: Vec<String> = match SchemaTagState::from_namespace_properties(&props) {
-            SchemaTagState::Known(tags) => tags.into_iter().map(|t| t.key).collect(),
-            _ => return ReprojectRow::error(name, "malformed sqe.schema-tags JSON".into()),
-        };
         let key = schema_key(catalog, ns);
-        let held = self.tag_load_memory.schema_held(&key);
-        let previous: &[String] = if tags.is_empty() { &held } else { &[] };
-        if tags.is_empty() && held.is_empty() {
+        let mut tags: Vec<String> = Vec::new();
+        if self.config.policy.inherit_schema_tags {
+            let props = match session_catalog.get_namespace(ns).await {
+                Ok(n) => n.properties().clone(),
+                Err(e) => return ReprojectRow::error(name, format!("get_namespace failed: {e}")),
+            };
+            tags = match SchemaTagState::from_namespace_properties(&props) {
+                SchemaTagState::Known(tags) => tags.into_iter().map(|t| t.key).collect(),
+                _ => return ReprojectRow::error(name, "malformed sqe.schema-tags JSON".into()),
+            };
+        }
+        if !tags.is_empty() {
+            // Add-or-update replaces the resource's tags: one write, no
+            // window in which Spark masks less.
+            if let Err(e) = self.project_schema_keys(catalog, ns, &[], &tags).await {
+                return ReprojectRow::error(name, format!("schema tags: {e}"));
+            }
+            let count = tags.len() as i64;
+            self.tag_load_memory.record_schema(key, tags);
+            return ReprojectRow::projected(name, count);
+        }
+        // Nothing to hold: delete what Ranger holds, read back rather than
+        // remembered, since another process may have written it.
+        let held = match self.held_schema_keys(catalog, ns).await {
+            Ok(held) => held,
+            Err(e) => return ReprojectRow::error(name, format!("reading Ranger: {e}")),
+        };
+        if held.is_empty() {
+            self.tag_load_memory.forget_schema(&key);
             return ReprojectRow::skipped(name);
         }
-        if let Err(e) = self.project_schema_keys(catalog, ns, previous, &tags).await {
+        if let Err(e) = self.project_schema_keys(catalog, ns, &held, &[]).await {
             return ReprojectRow::error(name, format!("schema tags: {e}"));
         }
-        let count = tags.len() as i64;
-        self.tag_load_memory.record_schema(key, tags);
-        ReprojectRow::projected(name, count)
+        self.tag_load_memory.forget_schema(&key);
+        let mut row = ReprojectRow::projected(name, 0);
+        row.message = "schema tags cleared".into();
+        row
     }
 
     async fn reproject_one_table(

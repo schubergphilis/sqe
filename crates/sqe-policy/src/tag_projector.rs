@@ -7,10 +7,16 @@
 //! has no reader for Iceberg properties, so WITHOUT this projection a tag-masked
 //! column is protected in SQE and returned RAW by Spark.
 //!
-//! The projection is one `PUT /service/tags/importservicetags` per table. Verified
-//! against Ranger 2.8: `op: add_or_update` writes the tag definition, the service
-//! resource and the association together and MERGES, so a table's projection does
-//! not disturb another table's. `op: delete` removes them.
+//! The projection is `PUT /service/tags/importservicetags`. Verified against
+//! Ranger 2.8 (#935): `op: add_or_update` writes the tag definitions, the service
+//! resources and their associations, and REPLACES the tag set of each resource it
+//! names; a resource it does not name is left alone, so one table's projection does
+//! not disturb another's. `op: delete` drops each resource it names whole, whatever
+//! tags the document lists, and succeeds on a resource Ranger does not hold.
+//!
+//! So a change is projected as add-or-update first, then a delete of only the
+//! resources left with no tags. A delete before the add would leave the column
+//! unmasked in other engines between the two calls.
 //!
 //! What this deliberately does NOT do is become the source of truth. Ranger's tag
 //! store is a projection; the Iceberg property still travels with the table.
@@ -181,6 +187,103 @@ pub async fn project_table_level_tags(
     Ok(())
 }
 
+/// What Ranger holds on the table-level resources of `table` (`*` for the
+/// schema-wide one), keyed like [`project_table_level_tags`] and given back
+/// as the tag keys that function takes: under `catalog_scoped` the
+/// catalog-qualified copies are folded into their bare key, so a read
+/// written back is not qualified twice.
+pub async fn held_table_level_tags(
+    projector: &dyn TagProjector,
+    catalog: &str,
+    namespace: &[String],
+    table: &str,
+    catalog_scoped: bool,
+) -> sqe_core::Result<Vec<String>> {
+    let key = TagTableKey::for_table(catalog, namespace, table, catalog_scoped)?;
+    let held = projector.held_table_level(&key).await?;
+    let prefix = format!("{catalog}.");
+    let mut keys: Vec<String> = Vec::new();
+    for tag in held {
+        let bare = match catalog_scoped {
+            true => tag.strip_prefix(&prefix).map(str::to_string).unwrap_or(tag),
+            false => tag,
+        };
+        if !keys.contains(&bare) {
+            keys.push(bare);
+        }
+    }
+    Ok(keys)
+}
+
+/// The two writes that take a table's column resources from `previous` to
+/// `tags`: the add-or-update of every column with tags, then the delete of
+/// every column `previous` tagged that has none now. Add first, so other
+/// engines never see a column untagged in between.
+pub fn column_replace_plan(previous: &ColumnTags, tags: &ColumnTags) -> (ColumnTags, ColumnTags) {
+    let add: ColumnTags = tags
+        .iter()
+        .filter(|(_, t)| !t.is_empty())
+        .map(|(c, t)| (c.clone(), t.clone()))
+        .collect();
+    let delete: ColumnTags = previous
+        .iter()
+        .filter(|(c, t)| !t.is_empty() && !add.contains_key(*c))
+        .map(|(c, t)| (c.clone(), t.clone()))
+        .collect();
+    (add, delete)
+}
+
+/// The tags of the table-level resources of `table` in a service-tags
+/// download (`GET /service/tags/secure/download/{service}`): the union of the
+/// `{database, table, column: *}` and `{database, table}` resources.
+pub fn held_in_download(doc: &serde_json::Value, table: &TagTableKey) -> Vec<String> {
+    let values = |e: &serde_json::Value, k: &str| -> Option<Vec<String>> {
+        let v = e.get(k)?.get("values")?.as_array()?;
+        Some(
+            v.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect(),
+        )
+    };
+    let is_table_level = |e: &serde_json::Value| -> bool {
+        let Some(obj) = e.as_object() else {
+            return false;
+        };
+        let column_ok = match obj.get("column") {
+            None => obj.len() == 2,
+            Some(_) => obj.len() == 3 && values(e, "column") == Some(vec!["*".to_string()]),
+        };
+        column_ok
+            && values(e, "database") == Some(vec![table.database.clone()])
+            && values(e, "table") == Some(vec![table.table.clone()])
+    };
+    let mut held: Vec<String> = Vec::new();
+    let resources = doc["serviceResources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for resource in resources {
+        if !is_table_level(&resource["resourceElements"]) {
+            continue;
+        }
+        let Some(id) = resource["id"].as_i64() else {
+            continue;
+        };
+        let ids = doc["resourceToTagIds"][id.to_string()]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for tag_id in ids.iter().filter_map(serde_json::Value::as_i64) {
+            if let Some(name) = doc["tags"][tag_id.to_string()]["type"].as_str() {
+                if !held.iter().any(|h| h == name) {
+                    held.push(name.to_string());
+                }
+            }
+        }
+    }
+    held
+}
+
 /// `tags` with each column's tags followed by their catalog-qualified names
 /// (`pii` -> `pii`, `sales.pii`).
 fn with_catalog_tags(catalog: &str, tags: &ColumnTags) -> ColumnTags {
@@ -209,9 +312,9 @@ pub trait TagProjector: Send + Sync {
         tags: &ColumnTags,
     ) -> sqe_core::Result<()>;
 
-    /// Make the table-level resource carry `tags` (the table's own tags, not
-    /// its columns'), deleting `previous` first, as [`Self::project`] does.
-    /// An empty `previous` only adds: nothing already projected is removed.
+    /// Make the table-level resources carry exactly `tags` (the table's own
+    /// tags, not its columns'): a non-empty `tags` replaces what they hold, an
+    /// empty one deletes them when `previous` names any tag.
     async fn project_table_level(
         &self,
         _table: &TagTableKey,
@@ -219,6 +322,13 @@ pub trait TagProjector: Send + Sync {
         _tags: &[String],
     ) -> sqe_core::Result<()> {
         Ok(())
+    }
+
+    /// The tags Ranger holds on the table-level resources of `table`, read
+    /// back from the tag store: the union of both resources. An error means
+    /// the store could not be read, never that it holds nothing.
+    async fn held_table_level(&self, _table: &TagTableKey) -> sqe_core::Result<Vec<String>> {
+        Ok(Vec::new())
     }
 
     /// False when projection is off, which lets callers skip the work and, more
@@ -358,6 +468,8 @@ pub struct RangerTagProjector {
     service_name: String,
     admin_user: String,
     admin_password: sqe_core::SecretString,
+    /// Counts failed calls in `sqe_tag_projection_failures_total`.
+    metrics: Option<std::sync::Arc<sqe_metrics::MetricsRegistry>>,
 }
 
 impl RangerTagProjector {
@@ -377,10 +489,77 @@ impl RangerTagProjector {
             service_name: cfg.service_name.clone(),
             admin_user: cfg.admin_user.clone(),
             admin_password: cfg.admin_password.clone(),
+            metrics: None,
         })
     }
 
+    /// Count failed Ranger calls in `sqe_tag_projection_failures_total`.
+    #[must_use = "with_metrics consumes self"]
+    pub fn with_metrics(mut self, metrics: std::sync::Arc<sqe_metrics::MetricsRegistry>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    fn count_failure(&self, op: &str) {
+        if let Some(m) = &self.metrics {
+            m.tag_projection_failures_total
+                .with_label_values(&[op])
+                .inc();
+        }
+    }
+
     async fn import(&self, body: serde_json::Value) -> sqe_core::Result<()> {
+        let done = self.send_import(body).await;
+        if done.is_err() {
+            self.count_failure("write");
+        }
+        done
+    }
+
+    /// The whole tag store of the service. Ranger's per-resource tag
+    /// listings ignore their resource filter (checked live on 2.8), so this
+    /// is the one read that answers for one resource.
+    async fn download(&self) -> sqe_core::Result<serde_json::Value> {
+        let done = self.send_download().await;
+        if done.is_err() {
+            self.count_failure("read");
+        }
+        done
+    }
+
+    async fn send_download(&self) -> sqe_core::Result<serde_json::Value> {
+        let url = format!(
+            // The secure path: the plain one is unauthenticated, and Ranger
+            // 2.9 stops serving it unless that is allowed explicitly.
+            "{}/service/tags/secure/download/{}",
+            self.base_url, self.service_name
+        );
+        let failed = |what: String| {
+            sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
+                format!("reading Ranger's tag store from {url} failed: {what}"),
+            )
+        };
+        let resp = self
+            .client
+            .get(&url)
+            .basic_auth(&self.admin_user, Some(self.admin_password.expose()))
+            .header("X-XSRF-HEADER", "x")
+            .send()
+            .await
+            .map_err(|e| failed(e.to_string()))?;
+        let status = resp.status();
+        // No tag store for the service yet: it holds nothing.
+        if status == reqwest::StatusCode::NO_CONTENT {
+            return Ok(serde_json::json!({}));
+        }
+        if !status.is_success() {
+            return Err(failed(format!("HTTP {status}")));
+        }
+        resp.json().await.map_err(|e| failed(e.to_string()))
+    }
+
+    async fn send_import(&self, body: serde_json::Value) -> sqe_core::Result<()> {
         let url = format!("{}/service/tags/importservicetags", self.base_url);
         let resp = self
             .client
@@ -391,9 +570,10 @@ impl RangerTagProjector {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-                    "Ranger tag projection request to {url} failed: {e}"
-                ))
+                sqe_core::SqeError::with_code(
+                    sqe_core::SqeErrorCode::ExecutionFailed,
+                    format!("Ranger tag projection request to {url} failed: {e}"),
+                )
             })?;
         if !resp.status().is_success() {
             let status = resp.status();
@@ -401,9 +581,10 @@ impl RangerTagProjector {
                 Ok(b) => b,
                 Err(e) => format!("<body unreadable: {e}>"),
             };
-            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-                "Ranger tag projection returned HTTP {status}: {text}"
-            )));
+            return Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
+                format!("Ranger tag projection returned HTTP {status}: {text}"),
+            ));
         }
         Ok(())
     }
@@ -418,20 +599,18 @@ impl TagProjector for RangerTagProjector {
         previous: &ColumnTags,
         tags: &ColumnTags,
     ) -> sqe_core::Result<()> {
-        // Delete what WAS there, then add what should be. The delete has to be built
-        // from `previous`: an unset column is absent from `tags`, so a delete built
-        // from `tags` names nothing, the stale association survives, and Spark keeps
-        // masking a column SQE no longer tags. Measured exactly that way before
-        // `previous` was threaded through.
-        if !previous.is_empty() {
-            let delete_doc = build_import_document(&self.service_name, table, previous, "delete");
-            self.import(delete_doc).await?;
-        }
-        // Nothing to add (the last tag was unset, or a stale resource is being
-        // cleared): the document would name no resource, so skip the request.
-        if !tags.is_empty() {
-            let add_doc = build_import_document(&self.service_name, table, tags, "add_or_update");
+        // Add-or-update replaces each named column's tags, then the columns
+        // that lost their last tag are deleted. Those are known only from
+        // `previous`: an unset column is absent from `tags`. Deleting first
+        // would leave every re-tagged column unmasked in between.
+        let (add, delete) = column_replace_plan(previous, tags);
+        if !add.is_empty() {
+            let add_doc = build_import_document(&self.service_name, table, &add, "add_or_update");
             self.import(add_doc).await?;
+        }
+        if !delete.is_empty() {
+            let delete_doc = build_import_document(&self.service_name, table, &delete, "delete");
+            self.import(delete_doc).await?;
         }
         debug!(
             database = %table.database,
@@ -449,13 +628,16 @@ impl TagProjector for RangerTagProjector {
         previous: &[String],
         tags: &[String],
     ) -> sqe_core::Result<()> {
+        // Add-or-update replaces, so a non-empty set goes alone; a delete
+        // first would unmask the table in between. The delete document names
+        // `previous` only because Ranger skips a resource with no tags in it;
+        // the delete drops the resource whatever it holds.
         let service = &self.service_name;
-        if !previous.is_empty() {
-            let doc = build_table_level_import_document(service, table, previous, "delete");
-            self.import(doc).await?;
-        }
         if !tags.is_empty() {
             let doc = build_table_level_import_document(service, table, tags, "add_or_update");
+            self.import(doc).await?;
+        } else if !previous.is_empty() {
+            let doc = build_table_level_import_document(service, table, previous, "delete");
             self.import(doc).await?;
         }
         debug!(
@@ -465,6 +647,11 @@ impl TagProjector for RangerTagProjector {
             "projected table tags into the Ranger tag store"
         );
         Ok(())
+    }
+
+    async fn held_table_level(&self, table: &TagTableKey) -> sqe_core::Result<Vec<String>> {
+        let doc = self.download().await?;
+        Ok(held_in_download(&doc, table))
     }
 
     fn enabled(&self) -> bool {
@@ -775,5 +962,144 @@ mod tests {
             add["serviceResources"].as_array().unwrap().is_empty(),
             "and the add names nothing, which is why the delete has to carry it"
         );
+    }
+
+    /// A change is the add-or-update of every tagged column, then the delete
+    /// of the columns that lost their last tag; a re-tagged column is never
+    /// deleted, so no engine sees it untagged in between (#935).
+    #[test]
+    fn a_column_change_adds_first_and_deletes_only_untagged_columns() {
+        let previous = tags(&[("ssn", &["pii"]), ("email", &["pii"]), ("note", &[])]);
+        let now = tags(&[("ssn", &["fin"]), ("phone", &["pii"]), ("note", &[])]);
+        let (add, delete) = column_replace_plan(&previous, &now);
+        assert_eq!(add, tags(&[("ssn", &["fin"]), ("phone", &["pii"])]));
+        assert_eq!(delete, tags(&[("email", &["pii"])]));
+
+        let (add, delete) = column_replace_plan(&ColumnTags::new(), &now);
+        assert_eq!(add.len(), 2);
+        assert!(delete.is_empty(), "no previous map deletes nothing");
+    }
+
+    fn download(resources: &[(&str, &str, Option<&str>, &[&str])]) -> serde_json::Value {
+        let (mut res, mut map, mut defs) =
+            (Vec::new(), serde_json::Map::new(), serde_json::Map::new());
+        let mut names: Vec<String> = Vec::new();
+        for (i, (db, table, column, tags)) in resources.iter().enumerate() {
+            let mut elements = serde_json::json!({
+                "database": {"values": [db], "isExcludes": false, "isRecursive": false},
+                "table": {"values": [table], "isExcludes": false, "isRecursive": false},
+            });
+            if let Some(c) = column {
+                elements["column"] = serde_json::json!({"values": [c]});
+            }
+            let id = 100 + i as i64;
+            res.push(serde_json::json!({"id": id, "resourceElements": elements}));
+            let ids: Vec<i64> = tags
+                .iter()
+                .map(|t| {
+                    let pos = names.iter().position(|n| n == t).unwrap_or_else(|| {
+                        names.push(t.to_string());
+                        names.len() - 1
+                    });
+                    let tag_id = 7 + pos as i64;
+                    defs.insert(
+                        tag_id.to_string(),
+                        serde_json::json!({"id": tag_id, "type": t}),
+                    );
+                    tag_id
+                })
+                .collect();
+            map.insert(id.to_string(), serde_json::json!(ids));
+        }
+        serde_json::json!({"serviceResources": res, "resourceToTagIds": map, "tags": defs})
+    }
+
+    /// The read-back takes only the two table-level resources of the one
+    /// table asked for: another schema's, a column's and a wider resource's
+    /// tags are not counted as held (#935).
+    #[test]
+    fn the_read_back_takes_only_this_tables_table_level_resources() {
+        let doc = download(&[
+            ("sales", "*", Some("*"), &["pii"]),
+            ("sales", "*", None, &["pii", "gold"]),
+            ("hr", "*", Some("*"), &["fin"]),
+            ("hr", "*", None, &["fin"]),
+            ("sales", "*", Some("ssn"), &["secret"]),
+            ("sales", "orders", Some("*"), &["other"]),
+        ]);
+        let key = TagTableKey::new("sales", "*");
+        assert_eq!(held_in_download(&doc, &key), vec!["pii", "gold"]);
+        assert_eq!(
+            held_in_download(&doc, &TagTableKey::new("hr", "*")),
+            vec!["fin"]
+        );
+        assert!(held_in_download(&doc, &TagTableKey::new("ops", "*")).is_empty());
+        assert!(held_in_download(&serde_json::json!({}), &key).is_empty());
+    }
+
+    /// A fake tag store with the semantics probed on Ranger 2.8: add-or-update
+    /// replaces a resource's tags, delete drops the resource.
+    #[derive(Default)]
+    struct Store(std::sync::Mutex<BTreeMap<String, Vec<String>>>);
+
+    #[async_trait]
+    impl TagProjector for Store {
+        async fn project(
+            &self,
+            _: &TagTableKey,
+            _: &ColumnTags,
+            _: &ColumnTags,
+        ) -> sqe_core::Result<()> {
+            Ok(())
+        }
+        async fn project_table_level(
+            &self,
+            t: &TagTableKey,
+            previous: &[String],
+            tags: &[String],
+        ) -> sqe_core::Result<()> {
+            let key = format!("{}|{}", t.database, t.table);
+            let mut store = self.0.lock().unwrap();
+            if !tags.is_empty() {
+                store.insert(key, tags.to_vec());
+            } else if !previous.is_empty() {
+                store.remove(&key);
+            }
+            Ok(())
+        }
+        async fn held_table_level(&self, t: &TagTableKey) -> sqe_core::Result<Vec<String>> {
+            let key = format!("{}|{}", t.database, t.table);
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    /// Under `catalog_scoped` the read-back folds `a.pii` into `pii`, so a
+    /// read written back keeps the same set however often it cycles, instead
+    /// of growing `a.a.pii` (#935).
+    #[tokio::test]
+    async fn a_scoped_read_written_back_is_stable() {
+        let store = Store::default();
+        let ns = vec!["sales".to_string()];
+        let pii = vec!["pii".to_string()];
+        project_table_level_tags(&store, "a", &ns, "*", true, &[], &pii)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let held = held_table_level_tags(&store, "a", &ns, "*", true)
+                .await
+                .unwrap();
+            assert_eq!(held, pii);
+            project_table_level_tags(&store, "a", &ns, "*", true, &[], &held)
+                .await
+                .unwrap();
+        }
+        let raw = store.0.lock().unwrap().get("a.sales|*").cloned().unwrap();
+        assert_eq!(raw, vec!["pii".to_string(), "a.pii".to_string()]);
     }
 }
