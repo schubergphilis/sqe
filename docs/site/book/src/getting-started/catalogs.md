@@ -136,6 +136,7 @@ type = "client_credentials"
 token_endpoint = "https://partner.com/oauth/tokens"
 client_id = "sqe-partner"
 client_secret = "..."   # use env override SQE__catalogs__partner__auth__client_secret
+# client_secret_file = "/run/secrets/sqe-partner"   # instead: read on every token request, so rotation needs no restart
 [catalogs.partner.storage]
 s3_endpoint = "https://partner-s3.example.com"
 s3_region = "us-east-1"

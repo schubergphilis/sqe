@@ -157,6 +157,8 @@ access_delegation = "none"      # "none" or "vended-credentials": send X-Iceberg
 require_vended_credentials = false # When true, FileIO never gets [storage] keys (issue #395); implies
                                 # access_delegation = "vended-credentials"
 # credentials = { type = "client_credentials", token_endpoint = "...", client_id = "...", client_secret = "..." }
+                                # or client_secret_file = "/run/secrets/..." instead of client_secret:
+                                # read on every token request, so a rotated secret needs no restart.
                                 # Engine credential identity (#934): reads load the table as the
                                 # person, then fetch the table's storage keys with THIS client
                                 # after the policy engine allowed `select`. The person's own

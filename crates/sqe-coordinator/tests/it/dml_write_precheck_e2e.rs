@@ -20,7 +20,7 @@ use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use sqe_core::{SecretString, Session, SqeConfig, SqeErrorCode};
 
-const POLARIS: &str = "http://localhost:18181/api";
+pub(crate) const POLARIS: &str = "http://localhost:18181/api";
 const CATALOG: &str = "test_warehouse";
 const READER: &str = "dml_precheck_reader";
 const PROPS_WRITER: &str = "dml_precheck_props";
@@ -97,6 +97,17 @@ pub(crate) async fn principal_token(root: &str, name: &str, extra: &[&str]) -> S
 
 /// [`principal_token`] with exactly `privileges` on the test catalog.
 pub(crate) async fn principal_token_with(root: &str, name: &str, privileges: &[&str]) -> String {
+    let (client_id, client_secret) = principal_credentials_with(root, name, privileges).await;
+    polaris_token(&client_id, &client_secret).await
+}
+
+/// A fresh principal `name` with exactly `privileges` on the test catalog;
+/// returns its `(client_id, client_secret)`.
+pub(crate) async fn principal_credentials_with(
+    root: &str,
+    name: &str,
+    privileges: &[&str],
+) -> (String, String) {
     let principal_role = format!("{name}_role");
     let catalog_role = format!("{name}_cr");
     let http = reqwest::Client::new();
@@ -163,11 +174,13 @@ pub(crate) async fn principal_token_with(root: &str, name: &str, privileges: &[&
         .expect("principal role assigned");
 
     let creds = &created["credentials"];
-    polaris_token(
-        creds["clientId"].as_str().expect("clientId"),
-        creds["clientSecret"].as_str().expect("clientSecret"),
+    (
+        creds["clientId"].as_str().expect("clientId").to_string(),
+        creds["clientSecret"]
+            .as_str()
+            .expect("clientSecret")
+            .to_string(),
     )
-    .await
 }
 
 pub(crate) fn session_for(name: &str, token: String) -> Session {

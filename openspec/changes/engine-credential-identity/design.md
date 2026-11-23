@@ -39,6 +39,8 @@ Probed on the test stack (Polaris 1.9, RustFS STS), 2026-11-22:
 
 **D9. Startup.** The server refuses a `credentials` block whose mode is not `client_credentials`, on a catalog with `require_vended_credentials = false`, when the policy backend is not Ranger (the only backend with default-deny `select`), or when `[policy.ranger] catalog_scoped` is off (bare keys cannot tell catalogs apart, so per-catalog default deny is impossible). The in-memory store is accepted only in test builds (its tests add explicit deny policies).
 
+**D10. Secret rotation without restart (#937).** `client_secret_file` names a file read on every `resolve_bearer`, trailing newline trimmed; exactly one of `client_secret` and `client_secret_file` per `client_credentials` block, and the file must be readable and non-empty at startup. The token cache key carries a fingerprint of the secret (first 16 bytes of its SHA-256, hex), so a rotated secret misses the cache and mints a new token at once. A per-identity (endpoint, client_id, scope) last-fingerprint map reports a rotation once, only after the new secret minted a token and never for the first token after start; the old entry is then dropped. The engine wiring writes an `AuditKind::Auth` event (`statement_type = "engine_secret_rotated"`, system actor, `app_name` = client id, no secret material). A wrong or unreadable file fails the token request; there is no fallback to the previous secret. The environment variable source stays a startup read.
+
 ## Risks
 
 - An engine principal with write-data is not exploitable through SQE (D1), but its keys reach workers in tickets; the docs recommend a read-only engine principal.
