@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Apache Arrow Flight SQL ODBC driver (apache-arrow-26.0.1) + pyodbc + probe script.
 # Mirrors the project's ubuntu-cpp-odbc compose service (compose.yaml): BUNDLED deps.
-FROM ubuntu:24.04@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289 AS build
+FROM ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db AS build
 ARG DEBIAN_FRONTEND=noninteractive
 ARG ARROW_TAG=apache-arrow-26.0.1
 RUN apt-get update -y -q && apt-get install -y -q --no-install-recommends \
@@ -31,7 +31,7 @@ RUN cmake --install /build \
     && ldd /opt/arrow/lib/libarrow_flight_sql_odbc.so \
     && ls /opt/arrow/share/*/flight/sql/odbc/
 
-FROM ubuntu:24.04@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289
+FROM ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -y -q && apt-get install -y -q --no-install-recommends \
       unixodbc odbcinst python3 python3-pyodbc ca-certificates \
