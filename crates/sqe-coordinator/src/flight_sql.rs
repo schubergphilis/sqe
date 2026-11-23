@@ -3413,14 +3413,37 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     #[test]
-    fn streamed_memory_refusal_keeps_resource_exhausted_status() {
+    fn streamed_query_memory_limit_is_failed_precondition_not_resource_exhausted() {
         use datafusion::error::DataFusionError;
-        let error = DataFusionError::Context("hash build".into(), Box::new(
-            DataFusionError::ResourcesExhausted("query.max_query_memory=65536 bytes".into()),
-        ));
+        // The statement's own cap (#933): a retry fails the same way, so it
+        // must not carry the status clients retry.
+        let error = DataFusionError::Context(
+            "hash build".into(),
+            Box::new(DataFusionError::ResourcesExhausted(
+                "query.max_query_memory=65536 bytes".into(),
+            )),
+        );
+        let status = Status::from(execution_error_to_flight(error));
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("query.max_query_memory"));
+        assert_eq!(
+            status
+                .metadata()
+                .get("x-sqe-error-code")
+                .map(|v| v.to_str().unwrap()),
+            Some("EXCEEDED_QUERY_MEMORY_LIMIT")
+        );
+    }
+
+    #[test]
+    fn streamed_pool_refusal_keeps_resource_exhausted_status() {
+        use datafusion::error::DataFusionError;
+        let error = DataFusionError::ResourcesExhausted(
+            "Failed to allocate additional 1024 bytes for sort with 0 bytes already allocated"
+                .into(),
+        );
         let status = Status::from(execution_error_to_flight(error));
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
-        assert!(status.message().contains("query.max_query_memory"));
     }
 
     #[tokio::test]

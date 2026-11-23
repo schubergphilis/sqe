@@ -53,8 +53,15 @@ impl BufferedResultBudget {
             )
         })?;
         if self.max_bytes > 0 && total > self.max_bytes {
+            // The statement's own cap is permanent for it; the pressure
+            // quota is a load refusal (#933).
+            let code = if self.limit_name == crate::query_memory::QueryQuota::normal(0).name() {
+                SqeErrorCode::ExceededQueryMemoryLimit
+            } else {
+                SqeErrorCode::ResourceExhausted
+            };
             return Err(SqeError::with_code(
-                SqeErrorCode::ResourceExhausted,
+                code,
                 format!("Buffered result needs {total} bytes, exceeding {}={} bytes; use LIMIT or a streaming client", self.limit_name, self.max_bytes),
             ));
         }
@@ -62,8 +69,13 @@ impl BufferedResultBudget {
         for pool in &self.pools {
             let reservation = MemoryConsumer::new("buffered-query-result").register(pool);
             reservation.try_grow(bytes).map_err(|e| {
+                let code = if crate::query_memory::is_query_memory_limit(&e) {
+                    SqeErrorCode::ExceededQueryMemoryLimit
+                } else {
+                    SqeErrorCode::ResourceExhausted
+                };
                 SqeError::with_code(
-                    SqeErrorCode::ResourceExhausted,
+                    code,
                     format!("Cannot retain {bytes} result bytes in the memory pool: {e}"),
                 )
             })?;
@@ -166,8 +178,19 @@ mod tests {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
         let mut budget = BufferedResultBudget::new(pool.clone(), pool.clone(), 4096);
         let error = budget.retain(wide_batch()).unwrap_err();
-        assert_eq!(error.error_code(), SqeErrorCode::ResourceExhausted);
+        assert_eq!(error.error_code(), SqeErrorCode::ExceededQueryMemoryLimit);
         assert_eq!(pool.reserved(), 0);
+    }
+
+    /// #933: the pressure quota is a load refusal, not the statement's own limit.
+    #[test]
+    fn pressure_quota_result_refusal_is_not_a_query_memory_limit() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let name = crate::query_memory::QueryQuota::under_pressure(0).name();
+        let mut budget =
+            BufferedResultBudget::new(pool.clone(), pool.clone(), 4096).with_limit_name(name);
+        let error = budget.retain(wide_batch()).unwrap_err();
+        assert_eq!(error.error_code(), SqeErrorCode::ResourceExhausted);
     }
 
     #[test]

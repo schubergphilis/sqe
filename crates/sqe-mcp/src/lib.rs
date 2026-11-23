@@ -1190,6 +1190,7 @@ fn client_error_text(error: &SqeError) -> String {
     let lower = full.to_ascii_lowercase();
     if code.is_user_error()
         || code == SqeErrorCode::ResourceExhausted
+        || code == SqeErrorCode::ExceededQueryMemoryLimit
         || lower.starts_with("rate limit")
         || lower.contains("too large to store in a decimal")
     {

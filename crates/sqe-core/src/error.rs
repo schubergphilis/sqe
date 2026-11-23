@@ -476,8 +476,17 @@ impl From<DataFusionError> for SqeError {
     }
 }
 
+/// The setting a statement's own memory cap names in its refusal. The
+/// coordinator's `QueryQuota::name` and the write paths share it (#933).
+pub const QUERY_MEMORY_LIMIT_SETTING: &str = "query.max_query_memory";
+
 fn datafusion_error_code(e: &DataFusionError) -> SqeErrorCode {
     match e {
+        DataFusionError::ResourcesExhausted(message)
+            if message.starts_with(QUERY_MEMORY_LIMIT_SETTING) =>
+        {
+            SqeErrorCode::ExceededQueryMemoryLimit
+        }
         DataFusionError::Plan(_) => SqeErrorCode::SemanticError,
         DataFusionError::SchemaError(_, _) => SqeErrorCode::SemanticError,
         DataFusionError::ResourcesExhausted(_) => SqeErrorCode::ResourceExhausted,
@@ -539,6 +548,11 @@ pub enum SqeErrorCode {
     QueryTimeout,
     QueryCancelled,
     ResourceExhausted,
+    /// One statement needed more memory than its own limit
+    /// (`query.max_query_memory`) allows, so a retry fails the same way.
+    /// Distinct from `ResourceExhausted` (load: a full pool, a queue, a
+    /// throttle), which a client may retry (#933).
+    ExceededQueryMemoryLimit,
     // Catalog / storage infrastructure
     CatalogError,
     /// Catalog is reachable but returned a 5xx, or the network call timed
@@ -630,6 +644,7 @@ impl SqeErrorCode {
             SqeErrorCode::QueryTimeout => "QUERY_TIMEOUT",
             SqeErrorCode::QueryCancelled => "QUERY_CANCELLED",
             SqeErrorCode::ResourceExhausted => "RESOURCE_EXHAUSTED",
+            SqeErrorCode::ExceededQueryMemoryLimit => "EXCEEDED_QUERY_MEMORY_LIMIT",
             SqeErrorCode::CatalogError => "CATALOG_ERROR",
             SqeErrorCode::CatalogUnavailable => "CATALOG_UNAVAILABLE",
             SqeErrorCode::CircuitBreakerOpen => "CIRCUIT_BREAKER_OPEN",
@@ -668,6 +683,7 @@ impl SqeErrorCode {
             SqeErrorCode::QueryTimeout => 65540,
             SqeErrorCode::QueryCancelled => 65542,
             SqeErrorCode::ResourceExhausted => 65537,
+            SqeErrorCode::ExceededQueryMemoryLimit => 65538,
             SqeErrorCode::CatalogError => 65600,
             SqeErrorCode::CatalogUnavailable => 65603,
             SqeErrorCode::CircuitBreakerOpen => 65604,
@@ -696,7 +712,9 @@ impl SqeErrorCode {
                 | SqeErrorCode::StorageCredentialsUnavailable => "EXTERNAL",
                 // Trino's type for its own resource limits
                 // (`EXCEEDED_*_LIMIT`, `QUERY_QUEUE_FULL`) (#902).
-                SqeErrorCode::ResourceExhausted => "INSUFFICIENT_RESOURCES",
+                SqeErrorCode::ResourceExhausted | SqeErrorCode::ExceededQueryMemoryLimit => {
+                    "INSUFFICIENT_RESOURCES"
+                }
                 _ => "INTERNAL_ERROR",
             }
         }
@@ -715,6 +733,7 @@ impl SqeErrorCode {
             }
             SqeErrorCode::CommitConflict => "Commit conflict",
             SqeErrorCode::ResourceExhausted => "Resource exhausted",
+            SqeErrorCode::ExceededQueryMemoryLimit => "Query exceeded its memory limit",
             SqeErrorCode::QueryTimeout => "Query timed out",
             SqeErrorCode::InternalError => "Internal error",
             _ => "Query failed",
@@ -1066,6 +1085,23 @@ fn regex_strip_type_sig(msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #933: a statement over its own memory limit has its own name, apart
+    /// from the load refusal, and is not a user error.
+    #[test]
+    fn exceeded_query_memory_limit_has_its_own_name() {
+        let code = SqeErrorCode::ExceededQueryMemoryLimit;
+        assert_eq!(code.name(), "EXCEEDED_QUERY_MEMORY_LIMIT");
+        assert_eq!(code.trino_error_type(), "INSUFFICIENT_RESOURCES");
+        assert_ne!(
+            code.trino_error_code(),
+            SqeErrorCode::ResourceExhausted.trino_error_code()
+        );
+        assert_eq!(SqeErrorCode::ResourceExhausted.name(), "RESOURCE_EXHAUSTED");
+        // The message naming the limit reaches the client.
+        let err = SqeError::with_code(code, "query.max_query_memory exceeded");
+        assert!(err.client_message().contains("query.max_query_memory"));
+    }
 
     // ---------------------------------------------------------------------------
     // #268: source-preserving errors (Sourced variant + *_src constructors)

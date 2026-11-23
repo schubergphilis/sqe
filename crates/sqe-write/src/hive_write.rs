@@ -46,6 +46,11 @@ use crate::write_handler::check_batch_within_policy;
 /// statement (#788).
 fn exec_err(what: &str, e: datafusion::error::DataFusionError) -> SqeError {
     let code = match e.find_root() {
+        datafusion::error::DataFusionError::ResourcesExhausted(message)
+            if message.starts_with(sqe_core::QUERY_MEMORY_LIMIT_SETTING) =>
+        {
+            SqeErrorCode::ExceededQueryMemoryLimit
+        }
         datafusion::error::DataFusionError::ResourcesExhausted(_) => {
             SqeErrorCode::ResourceExhausted
         }

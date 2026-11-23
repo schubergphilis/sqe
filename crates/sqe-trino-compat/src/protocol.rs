@@ -578,6 +578,18 @@ mod tests {
         assert_eq!(err.error_name, "RESOURCE_EXHAUSTED");
     }
 
+    /// A statement over its own memory cap has its own `errorName` (#933).
+    #[test]
+    fn a_query_memory_limit_failure_names_itself() {
+        let own = sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::ExceededQueryMemoryLimit,
+            "query.max_query_memory exceeded",
+        );
+        let err = TrinoError::from_sqe_error(&own, Some("q1"));
+        assert_eq!(err.error_name, "EXCEEDED_QUERY_MEMORY_LIMIT");
+        assert_eq!(err.error_type, "INSUFFICIENT_RESOURCES");
+    }
+
     #[test]
     fn test_trino_error_includes_failure_info() {
         let err = TrinoError {

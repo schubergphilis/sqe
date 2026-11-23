@@ -309,7 +309,7 @@ async fn a_write_runs_under_the_query_cap() {
     // The same code a read over the cap returns.
     assert_eq!(
         err.error_code(),
-        sqe_core::SqeErrorCode::ResourceExhausted,
+        sqe_core::SqeErrorCode::ExceededQueryMemoryLimit,
         "{msg}"
     );
 }

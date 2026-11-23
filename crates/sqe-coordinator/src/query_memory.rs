@@ -49,7 +49,7 @@ impl QueryQuota {
         if self.under_pressure {
             "query.pressure_admission_memory (server memory is red)"
         } else {
-            "query.max_query_memory"
+            sqe_core::QUERY_MEMORY_LIMIT_SETTING
         }
     }
 }
@@ -196,6 +196,24 @@ pub(crate) fn is_quota_refusal(error: &DataFusionError) -> bool {
     false
 }
 
+/// Whether `error` is a refusal by the statement's own cap,
+/// `query.max_query_memory`: a retry fails the same way (#933). The pressure
+/// quota, the coordinator pool and DataFusion's own refusals are load and
+/// stay `ResourceExhausted`.
+pub(crate) fn is_query_memory_limit(error: &DataFusionError) -> bool {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = next {
+        if let Some(DataFusionError::ResourcesExhausted(message)) = current
+            .downcast_ref::<DataFusionError>()
+            .map(DataFusionError::find_root)
+        {
+            return message.starts_with(QueryQuota::normal(0).name());
+        }
+        next = current.source();
+    }
+    false
+}
+
 /// The DataFusion setting a spill past the disk manager's cap names. SQE
 /// sets that cap from `coordinator.spill_max_bytes`, which is the knob an
 /// operator can turn.
@@ -216,7 +234,9 @@ pub(crate) fn execution_error(error: &DataFusionError) -> sqe_core::SqeError {
             ),
         );
     }
-    let code = if is_resources_exhausted(error) {
+    let code = if is_query_memory_limit(error) {
+        sqe_core::SqeErrorCode::ExceededQueryMemoryLimit
+    } else if is_resources_exhausted(error) {
         sqe_core::SqeErrorCode::ResourceExhausted
     } else {
         sqe_core::SqeErrorCode::ExecutionFailed
@@ -597,6 +617,52 @@ mod tests {
         assert!(is_resources_exhausted(&full));
         assert!(!is_quota_refusal(&full), "{full}");
         assert!(!is_quota_refusal(&DataFusionError::Execution("x".into())));
+    }
+
+    /// #933: only the statement's own cap gets the distinct name.
+    #[test]
+    fn execution_error_names_the_query_memory_limit_apart_from_load() {
+        use sqe_core::SqeErrorCode;
+        let shared: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(100));
+        let query = pool(shared.clone(), 60);
+        let a = MemoryConsumer::new("a").register(&query);
+        let own = a.try_grow(61).unwrap_err();
+        assert!(is_query_memory_limit(&own), "{own}");
+        assert_eq!(
+            execution_error(&own).error_code(),
+            SqeErrorCode::ExceededQueryMemoryLimit
+        );
+        let wrapped = own.context("sort");
+        assert!(is_query_memory_limit(&wrapped));
+        assert_eq!(
+            execution_error(&wrapped).error_code(),
+            SqeErrorCode::ExceededQueryMemoryLimit
+        );
+
+        // A pool full of other statements' memory is load.
+        let other = pool(shared.clone(), 60);
+        let b = MemoryConsumer::new("b").register(&other);
+        b.try_grow(60).unwrap();
+        let full = a.try_grow(41).unwrap_err();
+        assert!(!is_query_memory_limit(&full), "{full}");
+        assert_eq!(
+            execution_error(&full).error_code(),
+            SqeErrorCode::ResourceExhausted
+        );
+
+        // The pressure quota is load too.
+        let pressure = DataFusionError::ResourcesExhausted(format!(
+            "{} refused 10 bytes",
+            QueryQuota::under_pressure(0).name()
+        ));
+        assert!(!is_query_memory_limit(&pressure));
+        assert_eq!(
+            execution_error(&pressure).error_code(),
+            SqeErrorCode::ResourceExhausted
+        );
+        assert!(!is_query_memory_limit(&DataFusionError::Execution(
+            "x".into()
+        )));
     }
 
     #[test]

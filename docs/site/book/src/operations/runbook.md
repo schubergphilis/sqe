@@ -266,8 +266,17 @@ it still OOMKilled, the engine `memory_limit` sits too close to the pod limit.
 - A statement refused before it ran is `RESOURCE_EXHAUSTED` with a reason:
   the Flight metadata key `x-sqe-refusal-reason`, the Trino `errorName`
   `SQE_<REASON>` (errorType `INSUFFICIENT_RESOURCES`), and the MCP
-  `structuredContent.error`. A memory failure of a running statement has the
-  same code and no reason.
+  `structuredContent.error`. A memory failure of a running statement caused
+  by a full shared pool has the same code and no reason.
+- A statement that alone outgrows its own `query.max_query_memory` (after
+  spilling) is not load, and a retry fails the same way. It fails with
+  `EXCEEDED_QUERY_MEMORY_LIMIT` (Trino `errorType` `INSUFFICIENT_RESOURCES`;
+  Flight status `FAILED_PRECONDITION` with `x-sqe-error-code`), never
+  `RESOURCE_EXHAUSTED`, and the Trino endpoint sends no `Retry-After` with
+  it. The message names `query.max_query_memory`. Retry only after the
+  statement is changed (`LIMIT`, a narrower scan) or the limit is raised. A
+  read admitted under `pressure_admission_memory` keeps `RESOURCE_EXHAUSTED`:
+  the node was full.
 
   | Reason | Cause | Knob |
   |---|---|---|

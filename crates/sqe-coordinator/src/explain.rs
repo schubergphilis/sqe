@@ -768,7 +768,9 @@ async fn drain_capped(
 ) -> sqe_core::Result<Arc<dyn ExecutionPlan>> {
     use futures::TryStreamExt;
     let fail = |e: datafusion::error::DataFusionError| {
-        let code = if crate::query_memory::is_resources_exhausted(&e) {
+        let code = if crate::query_memory::is_query_memory_limit(&e) {
+            SqeErrorCode::ExceededQueryMemoryLimit
+        } else if crate::query_memory::is_resources_exhausted(&e) {
             SqeErrorCode::ResourceExhausted
         } else {
             SqeErrorCode::ExecutionFailed
