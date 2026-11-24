@@ -43,7 +43,7 @@ getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] 
 
 # Manifest lists and manifests are Avro. Pinned to the version the repo's
 # vendored iceberg-rust uses, so the two read the same files.
-apache-avro = "0.22"
+apache-avro = "0.23"
 arrow = "59"
 url = "2"
 serde = { version = "1", features = ["derive"] }
