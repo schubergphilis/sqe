@@ -169,6 +169,12 @@ mod tests {
         const PERSON: &str = "person-tok";
         const ENGINE: &str = "engine-tok";
 
+        fn engine_client_id() -> String {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!("sqe-engine-{n}")
+        }
+
         fn config(server: &MockServer, mode: DiscoveryEngineRead) -> SqeConfig {
             let toml_text = format!(
                 r#"
@@ -196,7 +202,10 @@ s3_path_style = true
             let mut config = toml::from_str::<SqeConfig>(&toml_text).expect("test config parses");
             config.catalog.credentials = Some(CatalogAuthConfig::ClientCredentials {
                 token_endpoint: format!("{}/token", server.uri()),
-                client_id: "sqe-engine".into(),
+                // The engine token cache is process-wide and keyed by
+                // endpoint and client; wiremock reuses ports, so a shared
+                // client id would serve one test the token another fetched.
+                client_id: engine_client_id(),
                 client_secret: "s".into(),
                 scope: Some("PRINCIPAL_ROLE:reader".into()),
                 client_secret_file: None,
@@ -303,7 +312,7 @@ s3_path_style = true
             let config = config(&server, DiscoveryEngineRead::Template);
             let got = credentials_for(&config, "ws_a").await;
             assert!(
-                matches!(got, Some(CatalogAuthConfig::ClientCredentials { ref client_id, .. }) if client_id == "sqe-engine"),
+                matches!(got, Some(CatalogAuthConfig::ClientCredentials { ref client_id, .. }) if client_id.starts_with("sqe-engine-")),
                 "{got:?}"
             );
             assert!(

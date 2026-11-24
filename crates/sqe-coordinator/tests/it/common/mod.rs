@@ -567,6 +567,12 @@ pub async fn ranger_session(user: &str) -> sqe_core::Session {
         .unwrap_or_else(|e| panic!("Keycloak ROPC failed for {user}: {e}"))
 }
 
+/// Held by every test that installs the process-wide engine identity wiring
+/// (`engine_identity_wiring::install`): a second test installing its own
+/// policy store or audit log would replace them under the first.
+#[allow(dead_code)]
+pub static ENGINE_WIRING_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Default budget for `eventually`.
 ///
 /// Two different propagation delays stack up in the access-control suite:

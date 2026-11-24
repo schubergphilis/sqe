@@ -104,6 +104,7 @@ async fn count(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]
 async fn engine_credential_read_gate_and_writes() {
+    let _wiring = crate::common::ENGINE_WIRING_LOCK.lock().await;
     // Setup as the person with an ordinary (delegated) catalog.
     let (session, plain) = crate::common::setup_handler().await;
     let _ = plain

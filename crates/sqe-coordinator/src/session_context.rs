@@ -1240,7 +1240,9 @@ fn metadata_catalog_resolver(
 /// exists, or Polaris rejects the warehouse (unauthorized / nonexistent) --
 /// the caller turns `None` into the existing "unknown catalog" error so an
 /// unauthorized warehouse is indistinguishable from a missing one.
-pub(crate) async fn discover_catalog_provider(
+///
+/// Public for the `it` tests that load through a discovered warehouse.
+pub async fn discover_catalog_provider(
     warehouse: &str,
     config: &SqeConfig,
     session: &Session,
