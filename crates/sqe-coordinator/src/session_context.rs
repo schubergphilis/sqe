@@ -1371,7 +1371,10 @@ impl crate::write_handler::CatalogDiscovery for PolarisCatalogDiscovery {
         session: &Session,
         table_cache: Option<&TableMetadataCache>,
     ) -> Option<Arc<SessionCatalog>> {
-        configured_session_catalog(name, config, session, table_cache).await
+        // A write target: engine credentials (#934) never serve it.
+        configured_session_catalog(name, config, session, table_cache)
+            .await
+            .map(SessionCatalog::shared_write_catalog)
     }
 
     async fn invalidate_session_cache(&self, username: &str) {

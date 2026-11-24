@@ -216,6 +216,15 @@ impl SessionCatalog {
         }
     }
 
+    /// [`Self::into_write_catalog`] for a shared session: a new one on the
+    /// delegated client in engine mode, otherwise `self` unchanged.
+    pub fn shared_write_catalog(self: Arc<Self>) -> Arc<Self> {
+        match self.write_view() {
+            Some(view) => Arc::new(view),
+            None => self,
+        }
+    }
+
     /// Load `table_ident` for a write (INSERT, UPDATE, DELETE, MERGE, DDL,
     /// maintenance): with the person's delegated credentials, never the
     /// engine's read keys. Identical to [`Self::load_table`] outside engine

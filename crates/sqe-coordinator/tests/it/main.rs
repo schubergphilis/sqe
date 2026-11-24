@@ -38,6 +38,7 @@ mod catalog_tag_inheritance_e2e;
 mod column_tag_ids_e2e;
 mod compaction_benchmark;
 mod compaction_distributed_benchmark;
+mod configured_write_keys;
 mod ctas_replace_shape_e2e;
 mod ctas_write_modes_e2e;
 mod discovery_engine_load;
