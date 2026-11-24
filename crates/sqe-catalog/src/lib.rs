@@ -45,6 +45,7 @@ pub mod sqlite_rs_catalog;
 pub mod time_travel;
 pub mod txn;
 pub mod vended_credentials;
+pub mod write_probe;
 pub use session_tuning::{engine_context, engine_session_config};
 pub mod read_json;
 mod read_json_buffer;
