@@ -20,6 +20,7 @@ use tracing::{debug, info, warn, Span};
 use sqe_catalog::time_travel::find_snapshot_at_timestamp;
 use sqe_catalog::{IcebergScanExec, SessionCatalog};
 use sqe_core::{QueryConfig, SecretStore, Session, SqeConfig, SqeError, SqeErrorCode};
+pub(crate) use sqe_lineage::ddl::{lineage_lifecycle_hint, lineage_rename_hint, lineage_scope};
 use sqlparser::ast::{Statement, TableFactor};
 
 use crate::adaptive_sort;
@@ -2338,7 +2339,8 @@ impl QueryHandler {
                         )?;
                     }
                     // Recorded first, so a failed rename's FAIL event names it.
-                    captured_plan = lineage_rename_hint(&self.config, session, stmt);
+                    captured_plan = sqe_sql::metadata::rename_names(stmt)
+                        .and_then(|(o, n)| lineage_rename_hint(&self.config, session, o, n));
                     // Cross-user: the table name itself changes; other users'
                     // SessionContexts hold the old name in their catalog
                     // provider's cached namespace listings.
@@ -7270,90 +7272,6 @@ fn build_describe_input(param_types: &[Option<DataType>]) -> sqe_core::Result<Ve
     )
     .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build DESCRIBE INPUT batch: {e}")))?;
     Ok(vec![batch])
-}
-
-/// The catalog and schema a session resolves unqualified and 2-part table
-/// names in, as `session_context` hands them to DataFusion
-/// (`with_default_catalog_and_schema`): the session's catalog
-/// (`X-Trino-Catalog`, `USE`) or the configured default, and the session's
-/// schema or `default`. Lineage names a scan of `customers` after it.
-pub(crate) fn lineage_scope(config: &SqeConfig, session: &Session) -> sqe_lineage::LineageScope {
-    sqe_lineage::LineageScope {
-        catalog: session
-            .default_catalog
-            .clone()
-            .filter(|c| !c.is_empty())
-            .unwrap_or_else(|| config.resolve_default_catalog()),
-        schema: session
-            .default_schema
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "default".to_string()),
-    }
-}
-
-/// `(catalog, schema, table)` of a DDL target, unqualified parts filled from
-/// [`lineage_scope`].
-fn lineage_table(
-    config: &SqeConfig,
-    session: &Session,
-    name: &sqlparser::ast::ObjectName,
-) -> (String, String, String) {
-    let scope = lineage_scope(config, session);
-    let table_ref = table_reference_of(name);
-    (
-        table_ref
-            .catalog()
-            .map(str::to_string)
-            .unwrap_or(scope.catalog),
-        table_ref
-            .schema()
-            .map(str::to_string)
-            .unwrap_or(scope.schema),
-        table_ref.table().to_string(),
-    )
-}
-
-/// Lineage hint for a DDL statement that changes a table's lifecycle without
-/// a source plan: the first table of `DROP TABLE` (the one `drop_table`
-/// acts on) and the target of a plain `CREATE TABLE`.
-fn lineage_lifecycle_hint(
-    config: &SqeConfig,
-    session: &Session,
-    name: &sqlparser::ast::ObjectName,
-    change: &str,
-) -> sqe_lineage::PlanOrHint {
-    let (catalog, schema, table) = lineage_table(config, session, name);
-    sqe_lineage::PlanOrHint::Hint(sqe_lineage::LineageHint::TableLifecycle {
-        catalog,
-        schema,
-        table,
-        change: change.to_string(),
-    })
-}
-
-/// Rename hint: new name, old one as `previousIdentifier`; a bare new name keeps the schema.
-fn lineage_rename_hint(
-    c: &SqeConfig,
-    s: &Session,
-    stmt: &Statement,
-) -> Option<sqe_lineage::PlanOrHint> {
-    let (old, new) = sqe_sql::metadata::rename_names(stmt)?;
-    let (catalog, previous_schema, previous_table) = lineage_table(c, s, old);
-    let (_, schema, table) = lineage_table(c, s, new);
-    let schema = if new.0.len() > 1 {
-        schema
-    } else {
-        previous_schema.clone()
-    };
-    let hint = sqe_lineage::LineageHint::TableRename {
-        catalog,
-        schema,
-        table,
-        previous_schema,
-        previous_table,
-    };
-    Some(sqe_lineage::PlanOrHint::Hint(hint))
 }
 
 /// OL lifecycle change a write statement makes to its output dataset, decided
