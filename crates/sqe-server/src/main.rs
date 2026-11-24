@@ -21,6 +21,17 @@ use sqe_trino_compat::server::{
 
 mod malloc_arena;
 
+// The release build (`--no-default-features`) must keep the AWS SDK default
+// credential chain for the coordinator's own S3 reads: without a static
+// `[storage]` key, the file TVFs and `read_parquet` resolve the pod role
+// (web identity, EKS Pod Identity) through it. `sqe_catalog::aws_config`
+// exists only with `glue` or `s3tables`, which the `sqe-coordinator`
+// dependency turns on. Dropping that feature fails this build instead of
+// silently narrowing keyless reads to instance metadata.
+const _: () = {
+    let _ = sqe_catalog::aws_config::sdk_object_store_credentials;
+};
+
 /// Build identity stamped in by `build.rs` (issue #669): shown in the
 /// startup log and `/api/v1/status` so a debug binary or a stale checkout
 /// is visible before anyone reads a benchmark off it.
@@ -1586,6 +1597,41 @@ fn log_hive_data_prefix_config(config: &SqeConfig) {
     }
 }
 
+/// Startup warnings for a setting that lets callers read past
+/// `[storage.tvf] allowed_object_store_prefixes` while `[storage]` holds no
+/// static S3 key. Such reads run on the AWS default credential chain, the pod
+/// role or instance profile on a cloud host, so the setting opens every path
+/// that identity can reach. Empty when a static key is set or neither
+/// setting is on.
+fn keyless_bypass_warnings(storage: &sqe_core::config::StorageConfig) -> Vec<String> {
+    if !storage.s3_access_key.is_empty() {
+        return Vec::new();
+    }
+    let mut settings = Vec::new();
+    if storage.tvf.allow_all_object_stores {
+        settings.push("storage.tvf.allow_all_object_stores (--allow-all-buckets)".to_string());
+    }
+    if !storage.tvf.object_store_admin_roles.is_empty() {
+        settings.push(format!(
+            "storage.tvf.object_store_admin_roles ({})",
+            storage.tvf.object_store_admin_roles.join(", ")
+        ));
+    }
+    settings
+        .into_iter()
+        .map(|setting| {
+            format!(
+                "[storage] holds no static S3 key, so object-store reads on the engine's \
+                 credentials use the AWS default credential chain (the pod role or instance \
+                 profile on a cloud host). {setting} lets callers read past \
+                 allowed_object_store_prefixes with that identity: every path it can reach is \
+                 readable. Scope the role's storage policy to the paths SQE should read, or \
+                 remove the setting."
+            )
+        })
+        .collect()
+}
+
 async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -1677,6 +1723,13 @@ async fn async_main() -> anyhow::Result<()> {
              prefix allowlist. Use only on a single-tenant or trusted-network \
              deployment."
         );
+    }
+
+    // Without a static key, reads on the engine's credentials use the pod
+    // role or instance profile; a setting that skips the prefix allowlist
+    // then opens whatever that identity can reach.
+    for warning in keyless_bypass_warnings(&config.storage) {
+        tracing::warn!("WARNING: {warning}");
     }
 
     // Static keys with a session token are temporary credentials frozen
@@ -3366,6 +3419,59 @@ fn build_oauth2_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn keyless_storage() -> sqe_core::config::StorageConfig {
+        sqe_core::config::StorageConfig::default()
+    }
+
+    #[test]
+    fn keyless_with_only_the_prefix_list_is_quiet() {
+        let mut storage = keyless_storage();
+        storage.tvf.allowed_object_store_prefixes = vec!["s3://staging/ingest/".to_string()];
+        assert!(keyless_bypass_warnings(&storage).is_empty());
+    }
+
+    #[test]
+    fn keyless_with_allow_all_warns() {
+        let mut storage = keyless_storage();
+        storage.tvf.allow_all_object_stores = true;
+        let warnings = keyless_bypass_warnings(&storage);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        for needle in [
+            "allow_all_object_stores",
+            "--allow-all-buckets",
+            "AWS default credential chain",
+        ] {
+            assert!(warnings[0].contains(needle), "{needle}: {}", warnings[0]);
+        }
+    }
+
+    #[test]
+    fn keyless_with_admin_roles_warns_and_names_them() {
+        let mut storage = keyless_storage();
+        storage.tvf.object_store_admin_roles = vec!["platform-admin".into(), "ops".into()];
+        let warnings = keyless_bypass_warnings(&storage);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let expected = "object_store_admin_roles (platform-admin, ops)";
+        assert!(warnings[0].contains(expected), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn keyless_with_both_bypasses_warns_twice() {
+        let mut storage = keyless_storage();
+        storage.tvf.allow_all_object_stores = true;
+        storage.tvf.object_store_admin_roles = vec!["admin".into()];
+        assert_eq!(keyless_bypass_warnings(&storage).len(), 2);
+    }
+
+    #[test]
+    fn a_static_key_silences_the_keyless_warning() {
+        let mut storage = keyless_storage();
+        storage.s3_access_key = "AKIAEXAMPLE".to_string();
+        storage.tvf.allow_all_object_stores = true;
+        storage.tvf.object_store_admin_roles = vec!["admin".into()];
+        assert!(keyless_bypass_warnings(&storage).is_empty());
+    }
 
     #[tokio::test]
     async fn flip_ready_and_drain_flips_readiness_first() {
