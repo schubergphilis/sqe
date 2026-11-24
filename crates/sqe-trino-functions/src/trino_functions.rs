@@ -222,6 +222,9 @@ fn register_trino_aggregate_aliases(ctx: &datafusion::prelude::SessionContext) {
     // (Trino 484); DataFusion's are double only.
     crate::real_aggregates::register_real_aggregates(ctx);
 
+    // approx_distinct over double / real, NaN and -0.0 counted as Trino does.
+    crate::approx_distinct::register_approx_distinct(ctx);
+
     // round over DECIMAL with Trino's result types.
     crate::decimal_math::register_decimal_math(ctx);
 }

@@ -38,7 +38,7 @@ Functions used in `GROUP BY` queries and `OVER` clauses. SQE inherits ~40 aggreg
 
 | Function | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
-| `approx_distinct(expr)` | `datafusion-builtin` | HyperLogLog distinct count. ~1% error. | `approx_distinct` | `approx_count_distinct` | `approx_count_distinct` | `approx_count_distinct` |
+| `approx_distinct(expr)` | `datafusion-builtin`, `sqe-trino-functions` for floats | HyperLogLog distinct count. ~1% error. Takes `double` and `real` as Trino does: every NaN counts as one value, and `-0.0` and `0.0` count as one. `approx_distinct.rs` | `approx_distinct` | `approx_count_distinct` | `approx_count_distinct` | `approx_count_distinct` |
 | `approx_median(expr)` | `datafusion-builtin` | Median estimate via t-digest. | - | - | `approx_percentile(0.5)` | `approx_quantile(0.5)` |
 | `approx_percentile_cont(expr, p)` | `datafusion-builtin` | Percentile estimate via t-digest. `p` in `[0, 1]`. | `approx_percentile` | `approx_percentile` | `approx_percentile` | `approx_quantile` |
 | `approx_percentile(expr, p)` | `sqe-trino-functions` | Trino-named alias of `approx_percentile_cont`. `trino_functions.rs:164` | `approx_percentile` | - | - | - |

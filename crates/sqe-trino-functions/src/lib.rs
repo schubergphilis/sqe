@@ -18,6 +18,7 @@
 
 pub mod agg_fns;
 pub mod aggregates;
+pub mod approx_distinct;
 pub mod array_fns;
 pub mod binary_fns;
 pub mod central_moments;
