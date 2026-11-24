@@ -20,3 +20,4 @@ mod sink_outage_chaos_test;
 mod sinks_file_test;
 mod sinks_http_test;
 mod sinks_spool_test;
+mod view_columns_test;

@@ -114,10 +114,14 @@ pub fn resolve_scope(trace: &mut ColumnTrace, scope: &crate::observer::LineageSc
 
 /// TableScan column trace rule (E4): each scan column emits one
 /// `ColumnDep` with `direct_identity()`. Terminal node, no recursion.
+///
+/// The trace follows the scan's OUTPUT columns (`projected_schema`), not the
+/// provider's full schema: an optimized plan carries a pushed-down
+/// projection, and a view's body is optimized before it is inlined, so
+/// tracing the full schema shifts every column above the first one dropped.
 fn trace_table_scan(ts: &TableScan) -> ColumnTrace {
     let (catalog, schema, table) = parse_table_ref(&ts.table_name.to_string());
-    ts.source
-        .schema()
+    ts.projected_schema
         .fields()
         .iter()
         .map(|f| {
