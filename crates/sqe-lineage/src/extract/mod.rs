@@ -414,8 +414,17 @@ pub fn extract_from_hint(
             schema,
             table,
             change,
+        }
+        | LineageHint::ViewLifecycle {
+            catalog,
+            schema,
+            view: table,
+            change,
         } => {
-            let id = dataset_identity(lookup, catalog, schema, table);
+            let mut id = dataset_identity(lookup, catalog, schema, table);
+            if matches!(hint, LineageHint::ViewLifecycle { .. }) {
+                id.facets.datasetType = Some(crate::event::DatasetTypeFacet::view());
+            }
             let mut outputs = vec![OutputDataset {
                 namespace: id.namespace,
                 name: id.name,

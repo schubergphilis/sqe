@@ -148,6 +148,10 @@ pub struct DatasetFacets {
     /// output never carries `lifecycleStateChange`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sqe_skipped: Option<SkippedFacet>,
+    /// OL `DatasetTypeDatasetFacet`: `VIEW` on the view a CREATE VIEW or
+    /// DROP VIEW names; absent on tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datasetType: Option<DatasetTypeFacet>,
 }
 
 /// Custom dataset facet `sqe_skipped`: `{"reason": "table_exists"}`.
@@ -159,6 +163,20 @@ pub struct SkippedFacet {
 impl SkippedFacet {
     /// The target of `CREATE TABLE IF NOT EXISTS ... AS` already existed.
     pub const TABLE_EXISTS: &'static str = "table_exists";
+}
+
+/// OL `DatasetTypeDatasetFacet`, set only on views.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DatasetTypeFacet {
+    pub datasetType: String,
+}
+
+impl DatasetTypeFacet {
+    pub fn view() -> Self {
+        Self {
+            datasetType: "VIEW".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

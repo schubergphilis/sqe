@@ -1,10 +1,13 @@
-//! Lineage hints for DDL that has no source plan: the session scope that
-//! names unqualified tables, and the `TableLifecycle` / `TableRename` hints
-//! the coordinator records for CREATE TABLE, DROP TABLE and a rename.
+//! Lineage for DDL: the session scope that names unqualified tables, the
+//! `TableLifecycle` / `ViewLifecycle` / `TableRename` hints the coordinator
+//! records for CREATE TABLE, DROP TABLE, DROP VIEW and a rename, and the
+//! `CreateView` plan it records for CREATE VIEW.
 
 use datafusion::common::TableReference;
+use datafusion::logical_expr::{CreateView, DdlStatement, LogicalPlan};
 use datafusion::sql::sqlparser::ast::ObjectName;
 use sqe_core::{Session, SqeConfig};
+use std::sync::Arc;
 
 fn table_reference_of(name: &ObjectName) -> TableReference {
     TableReference::from(name.to_string())
@@ -68,6 +71,43 @@ pub fn lineage_lifecycle_hint(
         table,
         change: change.to_string(),
     })
+}
+
+/// [`lineage_lifecycle_hint`] for a view (`DROP VIEW`): typed `VIEW`.
+pub fn lineage_view_lifecycle_hint(
+    config: &SqeConfig,
+    session: &Session,
+    name: &ObjectName,
+    change: &str,
+) -> sqe_lineage::PlanOrHint {
+    let (catalog, schema, view) = lineage_table(config, session, name);
+    sqe_lineage::PlanOrHint::Hint(sqe_lineage::LineageHint::ViewLifecycle {
+        catalog,
+        schema,
+        view,
+        change: change.to_string(),
+    })
+}
+
+/// CREATE VIEW lineage: the planned body under a DataFusion `CreateView`
+/// named after the view, from which the extractor reads the view's inputs,
+/// schema and column lineage.
+pub fn lineage_view_plan(
+    config: &SqeConfig,
+    session: &Session,
+    name: &ObjectName,
+    body: LogicalPlan,
+    or_replace: bool,
+) -> sqe_lineage::PlanOrHint {
+    let (catalog, schema, view) = lineage_table(config, session, name);
+    let create = CreateView {
+        name: TableReference::full(catalog, schema, view),
+        input: Arc::new(body),
+        or_replace,
+        definition: None,
+        temporary: false,
+    };
+    sqe_lineage::PlanOrHint::Plan(Box::new(LogicalPlan::Ddl(DdlStatement::CreateView(create))))
 }
 
 /// Rename hint: new name, old one as `previousIdentifier`; a bare new name keeps the schema.

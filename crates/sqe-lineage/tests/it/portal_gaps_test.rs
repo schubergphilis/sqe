@@ -20,7 +20,9 @@
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::TableReference;
 use datafusion::datasource::{provider_as_source, MemTable};
-use datafusion::logical_expr::{dml::InsertOp, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{
+    dml::InsertOp, CreateView, DdlStatement, LogicalPlan, LogicalPlanBuilder,
+};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use serde_json::{json, Value};
 use sqe_lineage::extract::{CatalogInfo, CatalogLookup, SNAPSHOT_ID_METADATA_KEY};
@@ -410,6 +412,88 @@ async fn drop_emits_the_dropped_table_with_lifecycle_drop() {
         }])
     );
     assert_eq!(got["run"], run_json());
+}
+
+/// CREATE VIEW: the view is the output, typed `VIEW`, with the inputs and
+/// column lineage of its body; `OR REPLACE` marks it `OVERWRITE`.
+#[tokio::test]
+async fn create_view_emits_the_view_with_its_inputs_and_dataset_type_view() {
+    let select = "SELECT country, upper(segment) AS seg FROM customers";
+    let source = plan_select(select).await;
+    for (or_replace, change) in [(false, "CREATE"), (true, "OVERWRITE")] {
+        let plan = LogicalPlan::Ddl(DdlStatement::CreateView(CreateView {
+            name: TableReference::full("workspace1", "default", "v_probe"),
+            input: Arc::new(source.clone()),
+            or_replace,
+            definition: None,
+            temporary: false,
+        }));
+        let mut ctx = complete(
+            "create_view",
+            &format!("CREATE VIEW v_probe AS {select}"),
+            Some(PlanOrHint::Plan(Box::new(plan))),
+        );
+        ctx.output_lifecycle = Some(change.into());
+        let got = emit(ctx).await;
+        let (data_source, symlinks) = identity("v_probe");
+        assert_eq!(got["inputs"], json!([customers_input()]));
+        assert_eq!(
+            got["outputs"],
+            json!([{
+                "namespace": "sqe://workspace1",
+                "name": "default.v_probe",
+                "facets": {
+                    "schema": { "fields": [
+                        { "name": "country", "type": "Utf8" },
+                        { "name": "seg", "type": "Utf8" }
+                    ]},
+                    "dataSource": data_source,
+                    "columnLineage": { "fields": {
+                        "country": { "inputFields": [dep("country", "DIRECT", "IDENTITY")] },
+                        "seg": { "inputFields": [dep("segment", "DIRECT", "TRANSFORMATION")] }
+                    }},
+                    "symlinks": symlinks,
+                    "lifecycleStateChange": { "lifecycleStateChange": change },
+                    "datasetType": { "datasetType": "VIEW" }
+                },
+                "outputFacets": {}
+            }]),
+            "\n{}",
+            serde_json::to_string_pretty(&got).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn drop_view_emits_the_view_with_lifecycle_drop_and_dataset_type_view() {
+    let hint = LineageHint::ViewLifecycle {
+        catalog: "workspace1".into(),
+        schema: "default".into(),
+        view: "v_probe".into(),
+        change: event::lifecycle::DROP.into(),
+    };
+    let got = emit(complete(
+        "drop_view",
+        "DROP VIEW IF EXISTS v_probe",
+        Some(PlanOrHint::Hint(hint)),
+    ))
+    .await;
+    let (data_source, symlinks) = identity("v_probe");
+    assert_eq!(got["inputs"], json!([]));
+    assert_eq!(
+        got["outputs"],
+        json!([{
+            "namespace": "sqe://workspace1",
+            "name": "default.v_probe",
+            "facets": {
+                "dataSource": data_source,
+                "symlinks": symlinks,
+                "lifecycleStateChange": { "lifecycleStateChange": "DROP" },
+                "datasetType": { "datasetType": "VIEW" }
+            },
+            "outputFacets": {}
+        }])
+    );
 }
 
 /// A scan the user qualified with the legacy SQL catalog name `iceberg` is

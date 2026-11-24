@@ -20,7 +20,10 @@ use tracing::{debug, info, warn, Span};
 use sqe_catalog::time_travel::find_snapshot_at_timestamp;
 use sqe_catalog::{IcebergScanExec, SessionCatalog};
 use sqe_core::{QueryConfig, SecretStore, Session, SqeConfig, SqeError, SqeErrorCode};
-pub(crate) use sqe_lineage::ddl::{lineage_lifecycle_hint, lineage_rename_hint, lineage_scope};
+pub(crate) use sqe_lineage::ddl::{
+    lineage_lifecycle_hint, lineage_rename_hint, lineage_scope, lineage_view_lifecycle_hint,
+    lineage_view_plan,
+};
 use sqlparser::ast::{Statement, TableFactor};
 
 use crate::adaptive_sort;
@@ -2487,12 +2490,21 @@ impl QueryHandler {
                     self.handle_set_snapshot_properties(session, pairs)
                 }
                 StatementKind::CreateView(stmt) => {
-                    self.handle_create_view(session, stmt).await?;
+                    self.handle_create_view(session, stmt, &mut captured_plan)
+                        .await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     self.invalidate_results_read_through_views();
                     Ok(vec![])
                 }
                 StatementKind::DropView(stmt) => {
+                    // Lineage as for DROP TABLE: the first name, recorded
+                    // before the drop, also on IF EXISTS of a missing view.
+                    if let Statement::Drop { names, .. } = stmt.as_ref() {
+                        captured_plan = names.first().map(|n| {
+                            let drop = sqe_lineage::event::lifecycle::DROP;
+                            lineage_view_lifecycle_hint(&self.config, session, n, drop)
+                        });
+                    }
                     self.catalog_ops.drop_view(session, stmt).await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     self.invalidate_results_read_through_views();
@@ -4355,10 +4367,26 @@ impl QueryHandler {
         session: &'a Session,
         sql: &'a str,
     ) -> futures::future::BoxFuture<'a, sqe_core::Result<SchemaRef>> {
-        Box::pin(self.get_schema_inner(session, sql))
+        Box::pin(self.get_schema_inner(session, sql, None))
     }
 
-    async fn get_schema_inner(&self, session: &Session, sql: &str) -> sqe_core::Result<SchemaRef> {
+    /// [`Self::get_schema`] that also hands back a query's unenforced plan
+    /// (CREATE VIEW lineage reads the view body from it).
+    pub(crate) fn get_schema_with_plan<'a>(
+        &'a self,
+        session: &'a Session,
+        sql: &'a str,
+        plan_out: &'a mut Option<LogicalPlan>,
+    ) -> futures::future::BoxFuture<'a, sqe_core::Result<SchemaRef>> {
+        Box::pin(self.get_schema_inner(session, sql, Some(plan_out)))
+    }
+
+    async fn get_schema_inner(
+        &self,
+        session: &Session,
+        sql: &str,
+        plan_out: Option<&mut Option<LogicalPlan>>,
+    ) -> sqe_core::Result<SchemaRef> {
         // GetFlightInfo / prepared-statement creation plan through here
         // without calling execute(). Cap the statement first so ADBC/JDBC
         // cannot burn the parser on an arbitrarily large query (#403).
@@ -4392,6 +4420,9 @@ impl QueryHandler {
                 .await?;
             let schema = sqe_catalog::file_tvf_prepare::analyzed_schema(&ctx, &plan)
                 .map_err(SqeError::planning)?;
+            if let Some(out) = plan_out {
+                *out = Some(plan);
+            }
             // `_tt_cleanup` drops here, deregistering any pinned providers
             // that schema-resolution required. Schema-only paths never read
             // batches, so dropping right after planning is fine.
@@ -7275,14 +7306,18 @@ fn build_describe_input(param_types: &[Option<DataType>]) -> sqe_core::Result<Ve
 }
 
 /// OL lifecycle change a write statement makes to its output dataset, decided
-/// from the parsed statement: `CREATE` for a CTAS, `OVERWRITE` for
-/// `CREATE OR REPLACE ... AS` and `INSERT OVERWRITE`, `TRUNCATE` for
+/// from the parsed statement: `CREATE` for a CTAS or view, `OVERWRITE` for
+/// `CREATE OR REPLACE` and `INSERT OVERWRITE`, `TRUNCATE` for
 /// `TRUNCATE TABLE`. Plain writes change no lifecycle.
 fn lineage_output_lifecycle(kind: &StatementKind) -> Option<String> {
     use sqe_lineage::event::lifecycle;
     let change = match kind {
         StatementKind::Ctas(stmt) => match stmt.as_ref() {
             Statement::CreateTable(ct) if ct.or_replace => lifecycle::OVERWRITE,
+            _ => lifecycle::CREATE,
+        },
+        StatementKind::CreateView(stmt) => match stmt.as_ref() {
+            Statement::CreateView(cv) if cv.or_replace => lifecycle::OVERWRITE,
             _ => lifecycle::CREATE,
         },
         StatementKind::Insert(stmt) => match stmt.as_ref() {
@@ -10170,6 +10205,10 @@ warehouse = "wh1"
         );
         assert_eq!(of("TRUNCATE TABLE t").as_deref(), Some("TRUNCATE"));
         assert_eq!(of("DELETE FROM t").as_deref(), None);
+        let create = of("CREATE VIEW v AS SELECT 1 AS a");
+        assert_eq!(create.as_deref(), Some("CREATE"));
+        let replace = of("CREATE OR REPLACE VIEW v AS SELECT 1 AS a");
+        assert_eq!(replace.as_deref(), Some("OVERWRITE"));
     }
 }
 

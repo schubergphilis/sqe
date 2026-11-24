@@ -41,6 +41,14 @@ pub enum LineageHint {
         table: String,
         change: String,
     },
+    /// [`Self::TableLifecycle`] for a view (`DROP VIEW`): the output also
+    /// carries the OL `datasetType: VIEW` facet.
+    ViewLifecycle {
+        catalog: String,
+        schema: String,
+        view: String,
+        change: String,
+    },
     /// `ALTER TABLE ... RENAME TO`: the table under its new name is the one
     /// output dataset, with `lifecycleStateChange: RENAME` and the old name
     /// as `previousIdentifier`. A rename never leaves its catalog.
