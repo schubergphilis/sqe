@@ -1298,3 +1298,20 @@ mod masking_policy_resolution_tests {
         );
     }
 }
+
+/// SHOW TAGS is read by position, `(column, tag, value, applied)`: clients
+/// take the first two, so renaming, retyping or reordering one breaks them.
+#[cfg(test)]
+mod show_tags_columns_tests {
+    #[test]
+    fn show_tags_columns_are_column_tag_value_applied() {
+        let tags = sqe_core::column_tags::ids::Resolved::default();
+        let batches = crate::QueryHandler::tags_to_record_batch(&tags).expect("batch");
+        let schema = batches[0].schema();
+        let shape: Vec<String> = (schema.fields().iter())
+            .map(|f| format!("{} {}", f.name(), f.data_type()))
+            .collect();
+        let want = ["column Utf8", "tag Utf8", "value Utf8", "applied Boolean"];
+        assert_eq!(shape, want);
+    }
+}
