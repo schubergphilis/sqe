@@ -96,6 +96,56 @@ Then reference it:
 helm install sqe deploy/helm/sqe/ --set existingSecret=sqe-credentials
 ```
 
+### Keyless S3 reads on EKS
+
+The file TVFs (`read_parquet`, `read_csv`, `read_json`) can read S3 with the
+pod's IAM role instead of a stored key. Leave `SQE_STORAGE__S3_ACCESS_KEY` and
+`SQE_STORAGE__S3_SECRET_KEY` unset, and keep a static `AWS_ACCESS_KEY_ID` out of
+the pod environment, which SQE would adopt as the key. With no static key, `sqe-server` resolves
+credentials through the AWS default chain: environment, shared config, web
+identity (IRSA), the container endpoint (EKS Pod Identity), then instance
+metadata. A statement that passes its own `access_key` and `secret_key` still
+uses those. No setting turns the chain on; an empty key turns it on.
+
+The chart runs its pods under the namespace's `default` service account.
+Associate the role with that account (EKS Pod Identity) or annotate it with the
+role ARN (IRSA). Then open only the paths the engine should read:
+
+```toml
+[storage]
+s3_region = "eu-west-1"   # or AWS_REGION in the pod environment
+
+[storage.tvf]
+allowed_object_store_prefixes = ["s3://staging/ingest/"]
+allow_inline_credentials = false
+```
+
+A path outside the list is refused before any S3 call, whatever the role
+allows. The list is empty by default, so a keyless install reads nothing until
+you name a prefix.
+
+Dropping the key changes who the engine is. The pod role becomes the identity
+behind every read on the engine's credentials, so its IAM policy is the real
+boundary. Four rules keep it narrow:
+
+- **Scope the role.** Grant `s3:GetObject` and `s3:ListBucket` on the
+  allowlisted prefixes only. Never reuse a role that can reach the warehouse
+  buckets.
+- **Require vended credentials.** Set `[catalog] require_vended_credentials =
+  true`, so Iceberg table reads take the catalog's per-table credentials and
+  never fall back to the pod role.
+- **Keep the bypasses off.** `allow_all_object_stores` (`--allow-all-buckets`)
+  and `object_store_admin_roles` let callers read past the prefix list with the
+  pod role. `sqe-server` logs a warning at startup when either is set without a
+  static key.
+- **Block instance metadata from pods.** The chain ends at instance metadata. A
+  pod whose role association is missing or broken then reads with the node's
+  instance profile, without an error. Set the IMDSv2 hop limit to 1 on the node
+  group so pods cannot reach it.
+
+Only `sqe-server` carries the chain. The `sqe-cli` release build has no AWS
+SDK, and without a key it reaches instance metadata only.
+
 ## Values Reference
 
 ### Image
