@@ -1212,11 +1212,9 @@ async fn contested_column_refuses_under_refuse() {
         sqe_core::SqeErrorCode::AccessDenied,
         "{err}"
     );
-    assert!(
-        err.to_string()
-            .contains("mask conflict on cat.ns1.ns2.employees.ssn"),
-        "{err}"
-    );
+    // The portal's governance_service.py matches this phrase (and ACCESS_DENIED).
+    let want = "mask conflict on cat.ns1.ns2.employees.ssn: more than one distinct column mask";
+    assert!(err.to_string().contains(want), "{err}");
 }
 
 /// The same mask from the resource policy and the tag is one mask: no error,
@@ -1253,11 +1251,9 @@ async fn contested_row_filter_refuses_under_refuse() {
         sqe_core::SqeErrorCode::AccessDenied,
         "{err}"
     );
-    assert!(
-        err.to_string()
-            .contains("row filter conflict on cat.ns1.ns2.employees"),
-        "{err}"
-    );
+    // The portal's governance_service.py matches this phrase (and ACCESS_DENIED).
+    let want = "row filter conflict on cat.ns1.ns2.employees: more than one distinct row filter";
+    assert!(err.to_string().contains(want), "{err}");
 
     let store = TagTestStore::new()
         .with_resource_policy(resource_policy)

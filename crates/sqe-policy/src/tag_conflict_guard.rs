@@ -349,7 +349,12 @@ mod tests {
         .await
         .unwrap_err()
         .to_string();
-        assert!(err.contains("mask conflict on c.ac.orders.amount"), "{err}");
+        // The portal's governance_service.py matches this phrase.
+        let want = "it would create a mask conflict on c.ac.orders.amount under mask_precedence";
+        assert!(
+            err.contains(&format!("tag change refused: {want}")),
+            "{err}"
+        );
         assert!(!err.contains("eng"), "the principal is not named: {err}");
     }
 
@@ -374,7 +379,12 @@ mod tests {
         .await
         .unwrap_err()
         .to_string();
-        assert!(err.contains("row filter conflict on c.ac.orders"), "{err}");
+        // The portal's governance_service.py matches this phrase.
+        let want = "it would create a row filter conflict on c.ac.orders (one row filter";
+        assert!(
+            err.contains(&format!("tag change refused: {want}")),
+            "{err}"
+        );
     }
 
     #[tokio::test]

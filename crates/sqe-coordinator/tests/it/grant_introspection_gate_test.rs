@@ -762,6 +762,7 @@ async fn apply_tag_privilege_gates_the_tag_statements() {
             .execute(&owner, sql, None)
             .await
             .expect_err("refused");
+        // The portal's governance_service.py matches "requires apply_tag".
         assert!(
             err.to_string().contains("requires apply_tag on ns.tbl.ssn"),
             "{sql}: {err}"
@@ -1784,6 +1785,7 @@ async fn tag_removal_remove_tag_gates_the_untags_only() {
             .execute(&session("steward"), sql, None)
             .await
             .expect_err(sql);
+        // The portal's governance_service.py matches "requires remove_tag".
         assert!(
             err.to_string()
                 .contains("requires remove_tag on ns.tbl.ssn"),
@@ -1821,6 +1823,7 @@ async fn tag_removal_admin_and_same() {
     assert_passed_tag_gate(admin.execute(&owner, sql, None).await, sql);
     for sql in UNTAG_STMTS {
         let err = admin.execute(&owner, sql, None).await.expect_err(sql);
+        // The portal's governance_service.py matches `tag_removal = "admin"`.
         assert!(
             err.to_string().contains("tag_removal = \"admin\""),
             "{sql}: {err}"
