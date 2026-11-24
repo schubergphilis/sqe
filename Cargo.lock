@@ -6912,7 +6912,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-auth"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6940,7 +6940,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-bench"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6972,7 +6972,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-catalog"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7042,7 +7042,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-cli"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7077,7 +7077,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-compaction"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -7104,7 +7104,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-coordinator"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7179,7 +7179,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-core"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -7210,7 +7210,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-geo"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "arrow",
  "datafusion",
@@ -7226,7 +7226,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-lineage"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7250,7 +7250,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-mcp"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -7281,7 +7281,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-metrics"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -7309,7 +7309,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-metrics-core"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "axum",
  "opentelemetry",
@@ -7325,7 +7325,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-planner"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7347,7 +7347,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-policy"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -7375,7 +7375,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-policy-api"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -7387,7 +7387,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-quack-client"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -7405,7 +7405,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-quack-server"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -7429,7 +7429,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-quack-wire"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -7443,7 +7443,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-server"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -7483,7 +7483,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-spill"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "datafusion",
  "thiserror 2.0.21",
@@ -7494,7 +7494,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-sql"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "chrono",
  "proptest",
@@ -7505,7 +7505,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-trino-compat"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -7545,7 +7545,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-trino-functions"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "arrow",
  "base64 0.23.1",
@@ -7574,7 +7574,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-trino-protocol"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -7600,7 +7600,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-worker"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7646,7 +7646,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-write"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "arrow",
  "arrow-array",
