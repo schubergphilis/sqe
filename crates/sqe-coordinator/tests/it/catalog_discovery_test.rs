@@ -1014,3 +1014,548 @@ async fn polaris_auto_ddl_resolves_discovered_warehouse() {
         .await
         .expect("DROP SCHEMA must resolve the target in the discovered warehouse");
 }
+
+/// Engine reads for discovered warehouses on the live stack
+/// (`[query] discovery_engine_read = "template"`).
+///
+/// Each test makes its own Polaris principals and warehouses under the
+/// `warehouse-engine` bucket, so runs never share grants or cached tokens.
+/// The person is metadata-only: a read of table data can only have moved
+/// with keys the engine fetched. The policy store is the in-memory one with
+/// no policy, so it grants every `select`. The engine identity and its
+/// audit log are process-wide, so each test also holds
+/// [`crate::common::ENGINE_WIRING_LOCK`].
+mod engine_read {
+    use super::*;
+
+    const POLARIS: &str = "http://localhost:18181";
+    const ALLOWLIST: &str = "eng_*";
+    /// Enough to list and load a table, never to read its data.
+    const METADATA: &[&str] = &[
+        "CATALOG_READ_PROPERTIES",
+        "NAMESPACE_LIST",
+        "NAMESPACE_READ_PROPERTIES",
+        "TABLE_LIST",
+        "TABLE_READ_PROPERTIES",
+    ];
+
+    struct Creds {
+        name: String,
+        id: String,
+        secret: String,
+    }
+
+    /// The Polaris management API as `root`.
+    struct Admin {
+        http: reqwest::Client,
+        token: String,
+    }
+
+    impl Admin {
+        async fn new() -> Self {
+            let http = reqwest::Client::new();
+            let body: serde_json::Value = http
+                .post(format!("{POLARIS}/api/catalog/v1/oauth/tokens"))
+                .form(&[
+                    ("grant_type", "client_credentials"),
+                    ("client_id", "root"),
+                    ("client_secret", "s3cr3t"),
+                    ("scope", "PRINCIPAL_ROLE:ALL"),
+                ])
+                .send()
+                .await
+                .expect("root token request")
+                .json()
+                .await
+                .expect("root token body");
+            let token = body["access_token"]
+                .as_str()
+                .expect("access_token")
+                .to_string();
+            Self { http, token }
+        }
+
+        /// `method path body`; 2xx or 409 (already there) passes.
+        async fn call(
+            &self,
+            method: reqwest::Method,
+            path: &str,
+            body: serde_json::Value,
+        ) -> serde_json::Value {
+            let response = self
+                .http
+                .request(method.clone(), format!("{POLARIS}{path}"))
+                .bearer_auth(&self.token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("{method} {path}: {e}"));
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            assert!(
+                status.is_success() || status == reqwest::StatusCode::CONFLICT,
+                "{method} {path}: {status} {text}"
+            );
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
+        }
+
+        /// A new principal with its own principal role.
+        async fn principal(&self, name: &str) -> Creds {
+            let created = self
+                .call(
+                    reqwest::Method::POST,
+                    "/api/management/v1/principals",
+                    serde_json::json!({ "principal": { "name": name } }),
+                )
+                .await;
+            let role = format!("{name}_role");
+            self.call(
+                reqwest::Method::POST,
+                "/api/management/v1/principal-roles",
+                serde_json::json!({ "principalRole": { "name": role } }),
+            )
+            .await;
+            self.call(
+                reqwest::Method::PUT,
+                &format!("/api/management/v1/principals/{name}/principal-roles"),
+                serde_json::json!({ "principalRole": { "name": role } }),
+            )
+            .await;
+            let credentials = &created["credentials"];
+            Creds {
+                name: name.to_string(),
+                id: credentials["clientId"]
+                    .as_str()
+                    .expect("clientId")
+                    .to_string(),
+                secret: credentials["clientSecret"]
+                    .as_str()
+                    .expect("clientSecret")
+                    .to_string(),
+            }
+        }
+
+        /// A warehouse at `s3://warehouse-engine/<name>/` that `root` manages,
+        /// with namespace `ns`.
+        async fn warehouse(&self, name: &str) {
+            let base = format!("s3://warehouse-engine/{name}/");
+            self.call(
+                reqwest::Method::POST,
+                "/api/management/v1/catalogs",
+                serde_json::json!({ "catalog": {
+                    "name": name,
+                    "type": "INTERNAL",
+                    "storageConfigInfo": {
+                        "storageType": "S3",
+                        "allowedLocations": [base],
+                        "endpoint": "http://localhost:19000",
+                        "endpointInternal": "http://rustfs:9000",
+                        "pathStyleAccess": true
+                    },
+                    "properties": {
+                        "default-base-location": base,
+                        "polaris.config.drop-with-purge.enabled": "true"
+                    }
+                }}),
+            )
+            .await;
+            self.grant(
+                name,
+                "service_admin",
+                "catalog_admin",
+                &["CATALOG_MANAGE_CONTENT"],
+            )
+            .await;
+            self.call(
+                reqwest::Method::POST,
+                &format!("/api/catalog/v1/{name}/namespaces"),
+                serde_json::json!({ "namespace": ["ns"] }),
+            )
+            .await;
+        }
+
+        /// Give `principal_role` a catalog role `catalog_role` on `warehouse`
+        /// holding `privileges`.
+        async fn grant(
+            &self,
+            warehouse: &str,
+            principal_role: &str,
+            catalog_role: &str,
+            privileges: &[&str],
+        ) {
+            let roles = format!("/api/management/v1/catalogs/{warehouse}/catalog-roles");
+            self.call(
+                reqwest::Method::POST,
+                &roles,
+                serde_json::json!({ "catalogRole": { "name": catalog_role } }),
+            )
+            .await;
+            for privilege in privileges {
+                self.call(
+                    reqwest::Method::PUT,
+                    &format!("{roles}/{catalog_role}/grants"),
+                    serde_json::json!({ "grant": { "type": "catalog", "privilege": privilege } }),
+                )
+                .await;
+            }
+            self.call(
+                reqwest::Method::PUT,
+                &format!(
+                    "/api/management/v1/principal-roles/{principal_role}/catalog-roles/{warehouse}"
+                ),
+                serde_json::json!({ "catalogRole": { "name": catalog_role } }),
+            )
+            .await;
+        }
+
+        async fn grant_to(&self, warehouse: &str, who: &Creds, privileges: &[&str]) {
+            let role = format!("{}_role", who.name);
+            self.grant(warehouse, &role, &format!("{}_cr", who.name), privileges)
+                .await;
+        }
+    }
+
+    /// One run: a metadata-only person, an engine principal, and an audit
+    /// file. Names carry a fresh suffix.
+    struct Run {
+        id: String,
+        admin: Admin,
+        person: Creds,
+        engine: Creds,
+        audit_dir: tempfile::TempDir,
+    }
+
+    impl Run {
+        async fn new() -> Self {
+            crate::common::init_tracing();
+            let id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+            let admin = Admin::new().await;
+            let person = admin.principal(&format!("meta_person_{id}")).await;
+            let engine = admin.principal(&format!("engine_{id}")).await;
+            // The person's session also builds the configured default catalog.
+            admin.grant_to("test_warehouse", &person, METADATA).await;
+            Self {
+                id,
+                admin,
+                person,
+                engine,
+                audit_dir: tempfile::tempdir().expect("tempdir"),
+            }
+        }
+
+        fn warehouse_name(&self, label: &str) -> String {
+            format!("eng_{label}_{}", self.id)
+        }
+
+        /// A warehouse holding `ns.t = {(7, 'engine')}`; the person gets
+        /// metadata only, the engine `engine_privileges` (none: no role).
+        async fn warehouse(&self, label: &str, engine_privileges: &[&str]) -> String {
+            let name = self.warehouse_name(label);
+            self.admin.warehouse(&name).await;
+            self.admin.grant_to(&name, &self.person, METADATA).await;
+            if !engine_privileges.is_empty() {
+                self.admin
+                    .grant_to(&name, &self.engine, engine_privileges)
+                    .await;
+            }
+            let mut seed = seed_config();
+            seed.catalog.warehouse = name.clone();
+            let root = make_handler(seed);
+            root.execute(
+                &live_session().await,
+                "CREATE TABLE ns.t AS SELECT 7 AS id, 'engine' AS label",
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("seed {name}.ns.t: {e}"));
+            sqe_coordinator::session_context::invalidate_all_session_caches().await;
+            name
+        }
+
+        fn config(&self, mode: sqe_core::config::DiscoveryEngineRead) -> SqeConfig {
+            let mut config = polaris_auto_config();
+            config.auth.client_id = self.person.id.clone();
+            config.auth.client_secret = self.person.secret.clone().into();
+            config.query.discovery_engine_read = mode;
+            config.query.discovery_engine_warehouses = vec![ALLOWLIST.into()];
+            config.catalog.require_vended_credentials = true;
+            config.catalog.credentials =
+                Some(sqe_core::config::CatalogAuthConfig::ClientCredentials {
+                    token_endpoint: config.auth.token_endpoint.clone(),
+                    client_id: self.engine.id.clone(),
+                    client_secret: self.engine.secret.clone().into(),
+                    client_secret_file: None,
+                    scope: None,
+                });
+            // No static key: data moves only with vended keys.
+            config.storage.s3_access_key = String::new();
+            config.storage.s3_secret_key = sqe_core::SecretString::new(String::new());
+            config
+        }
+
+        /// The person's session and a handler with the engine identity
+        /// installed against an open in-memory policy store.
+        async fn handler(
+            &self,
+            mode: sqe_core::config::DiscoveryEngineRead,
+        ) -> (Session, sqe_coordinator::QueryHandler) {
+            let config = self.config(mode);
+            let session = sqe_auth::Authenticator::new(&config.auth)
+                .await
+                .expect("authenticator")
+                .authenticate(&self.person.name, "")
+                .await
+                .expect("the metadata-only person authenticates");
+            let store: Arc<dyn sqe_policy::PolicyStore> =
+                Arc::new(sqe_policy::policy_store::InMemoryPolicyStore::new());
+            let audit = Arc::new(
+                sqe_metrics::audit::AuditLogger::new(
+                    self.audit_path().to_str().expect("utf-8 path"),
+                )
+                .expect("audit logger opens"),
+            );
+            sqe_coordinator::engine_identity_wiring::install(
+                Some(Arc::clone(&store)),
+                config.policy.mask_precedence,
+                Some(audit),
+            );
+            let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(
+                sqe_policy::plan_rewriter::PolicyPlanRewriter::new(Arc::clone(&store))
+                    .with_metadata_target(sqe_catalog::iceberg_metadata_tvf::metadata_tvf_target)
+                    .with_file_table(sqe_catalog::file_tvf_prepare::is_file_table_provider),
+            );
+            let tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+                &config.query_history,
+            ));
+            let handler = sqe_coordinator::QueryHandler::new(
+                policy,
+                Some(store),
+                config,
+                None,
+                None,
+                None,
+                None,
+                tracker,
+                None,
+                None,
+                None,
+                sqe_coordinator::RuntimeCatalogRegistry::default(),
+                sqe_core::SecretStore::default(),
+            )
+            .expect("QueryHandler::new");
+            (session, handler)
+        }
+
+        fn audit_path(&self) -> std::path::PathBuf {
+            self.audit_dir.path().join("audit.jsonl")
+        }
+
+        /// Audit lines that name `warehouse`.
+        fn audit_about(&self, warehouse: &str) -> Vec<String> {
+            std::fs::read_to_string(self.audit_path())
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains(warehouse))
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    impl Drop for Run {
+        fn drop(&mut self) {
+            sqe_coordinator::engine_identity_wiring::install(
+                None,
+                sqe_core::config::MaskPrecedence::default(),
+                None,
+            );
+        }
+    }
+
+    fn engine_read_privileges() -> Vec<&'static str> {
+        let mut p = METADATA.to_vec();
+        p.push("TABLE_READ_DATA");
+        p
+    }
+
+    fn rows(batches: &[arrow::record_batch::RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    use sqe_core::config::DiscoveryEngineRead::{Off, Template};
+
+    /// A person with metadata access only reads a discovered warehouse's
+    /// data through the engine; with the opt-in off the same read fails.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+    async fn a_metadata_only_person_reads_through_the_engine() {
+        let _live = LIVE_STACK_LOCK.lock().await;
+        let _wiring = crate::common::ENGINE_WIRING_LOCK.lock().await;
+        let run = Run::new().await;
+        let wh = run.warehouse("read", &engine_read_privileges()).await;
+        let sql = format!("SELECT id, label FROM {wh}.ns.t");
+
+        let (session, off) = run.handler(Off).await;
+        off.execute(&session, &sql, None)
+            .await
+            .expect_err("off: the metadata-only person cannot read the data");
+        sqe_coordinator::session_context::invalidate_all_session_caches().await;
+
+        let (session, handler) = run.handler(Template).await;
+        let batches = handler
+            .execute(&session, &sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("template: {sql}: {e}"));
+        assert_eq!(rows(&batches), 1);
+        let audit = run.audit_about(&wh);
+        assert!(
+            audit
+                .iter()
+                .any(|l| l.contains(&format!("discovered warehouse {wh}: engine read proved"))),
+            "one proof event: {audit:#?}"
+        );
+        assert!(
+            audit
+                .iter()
+                .any(|l| l.contains(&format!("engine key fetch: discovered warehouse {wh}"))),
+            "the key fetch is marked discovered: {audit:#?}"
+        );
+    }
+
+    /// A warehouse created in Polaris after the handler and session exist is
+    /// read through the engine with no restart.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+    async fn a_warehouse_created_during_the_run_is_readable() {
+        let _live = LIVE_STACK_LOCK.lock().await;
+        let _wiring = crate::common::ENGINE_WIRING_LOCK.lock().await;
+        let run = Run::new().await;
+        let (session, handler) = run.handler(Template).await;
+        let wh = run.warehouse_name("late");
+        let sql = format!("SELECT id FROM {wh}.ns.t");
+        handler
+            .execute(&session, &sql, None)
+            .await
+            .expect_err("the warehouse does not exist yet");
+
+        assert_eq!(run.warehouse("late", &engine_read_privileges()).await, wh);
+        let batches = handler
+            .execute(&session, &sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{sql} after creation: {e}"));
+        assert_eq!(rows(&batches), 1);
+    }
+
+    /// The engine has no role on an allowlisted warehouse. Polaris answers
+    /// any principal's `/v1/config`, so the proof passes; the grant check is
+    /// Polaris's `/credentials`, which refuses the engine. The read fails
+    /// closed with no rows and does not fall back to the person's keys.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+    async fn an_engine_without_a_role_fails_closed() {
+        let _live = LIVE_STACK_LOCK.lock().await;
+        let _wiring = crate::common::ENGINE_WIRING_LOCK.lock().await;
+        let run = Run::new().await;
+        let wh = run.warehouse("norole", &[]).await;
+        let (session, handler) = run.handler(Template).await;
+        let err = handler
+            .execute(&session, &format!("SELECT id FROM {wh}.ns.t"), None)
+            .await
+            .expect_err("no rows: the engine's key fetch is refused");
+        assert!(
+            err.to_string().contains("403"),
+            "the read fails on the refused key fetch: {err}"
+        );
+        let audit = run.audit_about(&wh);
+        assert!(
+            audit
+                .iter()
+                .any(|l| l.contains(&format!("discovered warehouse {wh}: engine read proved"))),
+            "/v1/config proves the catalog, not a grant: {audit:#?}"
+        );
+        let fetch = audit
+            .iter()
+            .find(|l| l.contains(&format!("engine key fetch: discovered warehouse {wh}")))
+            .unwrap_or_else(|| panic!("one engine key fetch event: {audit:#?}"));
+        assert!(
+            fetch.contains("\"status\":\"failure\"")
+                && fetch.contains("ENGINE_CREDENTIALS_FAILED")
+                && fetch.contains("403"),
+            "the key fetch is audited as refused: {fetch}"
+        );
+    }
+
+    /// Writes never borrow the engine: an engine allowed to write cannot
+    /// carry a metadata-only person's INSERT, while that person's SELECT on
+    /// the same warehouse reads through the engine.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+    async fn a_write_uses_the_persons_delegation() {
+        let _live = LIVE_STACK_LOCK.lock().await;
+        let _wiring = crate::common::ENGINE_WIRING_LOCK.lock().await;
+        let run = Run::new().await;
+        let mut engine_privileges = engine_read_privileges();
+        engine_privileges.push("TABLE_WRITE_DATA");
+        let wh = run.warehouse("write", &engine_privileges).await;
+        let (session, handler) = run.handler(Template).await;
+        let read = format!("SELECT id FROM {wh}.ns.t");
+        assert_eq!(
+            rows(
+                &handler
+                    .execute(&session, &read, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("{read}: {e}"))
+            ),
+            1
+        );
+        handler
+            .execute(
+                &session,
+                &format!("INSERT INTO {wh}.ns.t VALUES (8, 'person')"),
+                None,
+            )
+            .await
+            .expect_err("the INSERT runs on the person's delegation, which cannot write");
+        sqe_coordinator::session_context::invalidate_all_session_caches().await;
+        assert_eq!(
+            rows(
+                &handler
+                    .execute(&session, &read, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("{read}: {e}"))
+            ),
+            1,
+            "nothing was written"
+        );
+    }
+
+    /// A signed catalog scope (#908) that leaves the warehouse out refuses
+    /// it before any proof call: the read fails and no proof event names it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+    async fn a_catalog_scope_refuses_before_the_proof() {
+        let _live = LIVE_STACK_LOCK.lock().await;
+        let _wiring = crate::common::ENGINE_WIRING_LOCK.lock().await;
+        let run = Run::new().await;
+        let wh = run.warehouse("scoped", &engine_read_privileges()).await;
+        let (session, handler) = run.handler(Template).await;
+        let scope = sqe_core::catalog_scope::CatalogScope::new(
+            session.user.username.clone(),
+            "jti-engine-read",
+            Utc::now() + Duration::hours(1),
+            [(
+                "test_warehouse".to_string(),
+                sqe_core::catalog_scope::CatalogAccess::ReadOnly,
+            )],
+        );
+        let scoped = session.with_catalog_scope(Some(Arc::new(scope)));
+        handler
+            .execute(&scoped, &format!("SELECT id FROM {wh}.ns.t"), None)
+            .await
+            .expect_err("outside the signed scope");
+        let audit = run.audit_about(&wh);
+        assert!(
+            !audit.iter().any(|l| l.contains("engine read")),
+            "no proof ran: {audit:#?}"
+        );
+    }
+}

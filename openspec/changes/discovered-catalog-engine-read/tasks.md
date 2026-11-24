@@ -11,6 +11,7 @@
 - [x] 2.2 Membership proof: allowlist, configured-name check, person `/config` (existing call), engine `/config` with prefix compare; verdict cached per session catalog (D2, D3)
   - Done differently: the person's `/config` is an explicit call before the build, so the proof finishes before anything is built. Reserved names (`system`, `datafusion`) refuse at the configured-name step.
 - [x] 2.3 Attach the identity only after a proved verdict; any failed step falls back to the delegated client (D0, D2)
+  - A failed proof step falls back. A key fetch refused after a passed proof does not: on Polaris the engine passes `/config` without a role, so the read fails with `ENGINE_CREDENTIALS_FAILED` (D2, measured in 4.5).
 - [x] 2.4 Read gate and policy key use the registered SQL name, the same one as the rewriter's `TableScope` (D4)
 - [x] 2.5 Audit: proof outcome event; `discovered = true` on key-fetch events; no secret values (D8)
   - The proof event has no resource: the audit object types are table and view. It names the warehouse in its text.
@@ -35,10 +36,10 @@
 - [x] 4.4 wiremock: engine `/config` 403, wrong prefix, or outside the allowlist -> person's load carries the delegation header and no `/credentials` call; proof passes -> no delegation header, `/credentials` with the engine token; configured `scope = "profile"` sent verbatim in the token form; two discovered warehouses -> one token request
   - Proof level in `discovery_engine::tests::proof`: off, allowlist miss, configured or reserved name, prefix mismatch, missing prefix, person 403, engine 403, pass, scope in the token form, one token for two warehouses.
   - Load level in `tests/it/discovery_engine_load.rs` (plain tests, `cargo test -p sqe-coordinator --test it discovery_engine_load`): a table load through `discover_catalog_provider` on a proved warehouse returns the engine's keys, sends no delegation header and one `/credentials` call with the engine bearer, and the token form's scope is exactly `profile`; engine 403, a different engine prefix and a warehouse outside the allowlist each load with the person's keys, `vended-credentials` on the load and no `/credentials` call; two proved warehouses share one token request; a warehouse outside the session's catalog scope makes no call at all.
-- [ ] 4.5 IT (`tests/it/catalog_discovery_test.rs`, test stack, `InMemoryPolicyStore`):
+- [x] 4.5 IT (`tests/it/catalog_discovery_test.rs`, test stack, `InMemoryPolicyStore`):
   - a metadata-only person reads a discovered warehouse through the engine;
   - a warehouse created in Polaris during the test is readable with no restart;
-  - an allowlisted warehouse where the engine has no role falls back to the person's keys and fails on storage;
+  - an allowlisted warehouse where the engine has no role: Polaris answers the engine's `/config`, so the proof passes, the key fetch gets 403 and the read fails with `ENGINE_CREDENTIALS_FAILED` and no rows (no fallback to the person's keys);
   - a write to a discovered warehouse uses the person's delegation;
   - binding-mode catalog scope (#908) refuses a discovered warehouse outside the signed scope before any proof call.
 - [ ] 4.6 Live Ranger suite (`make test-access-control`): a discovered warehouse with no `select` policy reads zero rows with no `/credentials` call; adding the policy makes it readable at the next policy refresh

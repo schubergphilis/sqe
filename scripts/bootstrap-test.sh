@@ -96,7 +96,7 @@ done
 # 'system'. Polaris 1.5.0 rejects catalogs whose allowed
 # locations overlap an existing catalog, so the discovery warehouse can
 # no longer nest under s3://warehouse/.
-for BUCKET in warehouse warehouse-discovery warehouse-system; do
+for BUCKET in warehouse warehouse-discovery warehouse-system warehouse-engine; do
 echo -n "Creating S3 bucket '$BUCKET'... "
 if command -v aws &> /dev/null; then
     if AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \

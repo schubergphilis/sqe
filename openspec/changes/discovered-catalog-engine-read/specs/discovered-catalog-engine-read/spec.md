@@ -22,9 +22,14 @@ Otherwise SQE SHALL read the warehouse with the person's delegated keys.
 - **THEN** the rows are returned with masks and row filters applied
 - **AND** no `sqe.toml` entry and no restart were needed for that warehouse
 
-#### Scenario: Engine has no role in the warehouse
+#### Scenario: Engine's /config refused
 - **WHEN** the engine's `/config` for the warehouse answers 403
 - **THEN** SQE reads with the person's delegated keys and makes no `/credentials` call
+
+#### Scenario: Engine has no role in the warehouse
+- **WHEN** the engine's `/config` answers 200 with the person's prefix but the engine holds no catalog role in the warehouse (Polaris behaviour)
+- **THEN** the proof passes, the engine's `/credentials` call is refused, and the read fails with `ENGINE_CREDENTIALS_FAILED`
+- **AND** no rows are returned and the read does not fall back to the person's keys
 
 #### Scenario: Prefix mismatch
 - **WHEN** the person's and the engine's `/config` responses carry different prefixes

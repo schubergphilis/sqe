@@ -528,8 +528,16 @@ in this order:
    `overrides.prefix`. A missing prefix on either side proves nothing.
 
 Any failed step leaves the warehouse on the person's delegated keys, the same
-as `"off"`. A person who cannot reach the warehouse stops the proof at step 3,
-so the engine is never asked. Each proof writes one `Auth` audit event with
+as `"off"`. A warehouse the person cannot resolve stops the proof at step 3,
+so the engine is never asked.
+
+Steps 3 and 4 prove the catalog, not a grant. Polaris answers
+`/v1/config?warehouse=` for any authenticated principal, so the engine passes
+step 4 on a warehouse where it holds no role. The grant check is Polaris's own
+`/credentials` call at read time. Give the engine principal a catalog role on
+every warehouse the allowlist covers. Without one, reads of that warehouse fail
+with `ENGINE_CREDENTIALS_FAILED` and the key-fetch audit event records the 403.
+They do not fall back to the person's keys. Each proof writes one `Auth` audit event with
 `statement_type` `discovery_engine_proof`, naming the warehouse and, on a
 refusal, the step that refused it. Key fetches on a proved warehouse carry
 `discovered_engine_key_fetch`. With `"off"` no proof runs and no event is
