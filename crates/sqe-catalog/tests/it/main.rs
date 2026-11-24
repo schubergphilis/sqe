@@ -42,3 +42,4 @@ mod sqlite_rs_catalog_test;
 mod table_cache_state_machine_test;
 mod trino_colname_compat;
 mod trino_row_compat;
+mod write_probe_test;

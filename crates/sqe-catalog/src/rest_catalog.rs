@@ -4301,11 +4301,10 @@ impl SessionCatalog {
     /// statement used to plan, write data files and fail on the first
     /// `PutObject`. Two questions, both asked as the caller:
     ///
-    /// 1. The catalog, on every REST catalog: a commit setting `main` to the
-    ///    snapshot it already points at (requirements only when there is no
-    ///    `main`), guarded by an `assert-table-uuid` that can never match.
-    ///    Polaris authorizes the update (`SET_TABLE_SNAPSHOT_REF` /
-    ///    `UPDATE_TABLE`) before it checks requirements, so a reader gets
+    /// 1. The catalog, on every REST catalog: a commit with the updates the
+    ///    write sends (`crate::write_probe`), guarded by an `assert-table-uuid`
+    ///    that can never match. Polaris authorizes the updates before it
+    ///    checks requirements, so a reader gets
     ///    403 and a writer 409; a catalog that applied the update anyway
     ///    would change nothing.
     /// 2. The object store, when the catalog vends credentials: write and
@@ -4374,27 +4373,8 @@ impl SessionCatalog {
         let requirements = serde_json::json!([
             { "type": "assert-table-uuid", "uuid": wrong_uuid.to_string() }
         ]);
-        let updates = match metadata
-            .refs_iter()
-            .find(|(name, _)| *name == iceberg::spec::MAIN_BRANCH)
-        {
-            Some((_, reference)) => serde_json::to_value(vec![TableUpdate::SetSnapshotRef {
-                ref_name: iceberg::spec::MAIN_BRANCH.to_string(),
-                reference: reference.clone(),
-            }])
-            .unwrap_or_else(|_| serde_json::json!([])),
-            // No `main` yet. An empty update list is authorized by Polaris as the
-            // generic `UPDATE_TABLE`, which needs `TABLE_WRITE_PROPERTIES`
-            // (`table-properties-write`) -- a privilege an INSERT grant
-            // deliberately does not confer, so the first INSERT into a fresh
-            // table was refused. Dropping the absent `main` is a no-op, and
-            // Polaris authorizes it as `REMOVE_TABLE_SNAPSHOT_REF`, which the
-            // `table-data-write` closure includes.
-            None => serde_json::to_value(vec![TableUpdate::RemoveSnapshotRef {
-                ref_name: iceberg::spec::MAIN_BRANCH.to_string(),
-            }])
-            .unwrap_or_else(|_| serde_json::json!([])),
-        };
+        let updates = serde_json::to_value(crate::write_probe::write_probe_updates(metadata))
+            .unwrap_or_else(|_| serde_json::json!([]));
         match self
             .post_noop_commit(table_ident, requirements, updates)
             .await
@@ -8032,13 +8012,12 @@ mod vended_credentials_rest_tests {
         );
     }
 
-    /// A table with no `main` yet (nothing written): the check must not send an
-    /// empty update list, which Polaris authorizes as `UPDATE_TABLE`
-    /// (`table-properties-write`) and an INSERT-only grantee lacks. It drops the
-    /// absent `main` instead, a no-op Polaris authorizes as
-    /// `REMOVE_TABLE_SNAPSHOT_REF`, inside the `table-data-write` closure.
+    /// A table with no `main` yet (nothing written): the check sends what a
+    /// first append sends (`add-snapshot`, `set-snapshot-ref` main), not an
+    /// empty update list (`UPDATE_TABLE`, `table-properties-write`) and not a
+    /// ref removal (the right to drop branches and tags).
     #[tokio::test]
-    async fn write_check_without_main_probes_with_remove_snapshot_ref() {
+    async fn write_check_without_main_probes_with_a_first_append() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/config"))
@@ -8091,9 +8070,13 @@ mod vended_credentials_rest_tests {
             sent[0]["requirements"],
             serde_json::json!([{"type": "assert-table-uuid", "uuid": wrong.to_string()}])
         );
+        let updates = &sent[0]["updates"];
+        assert_eq!(updates[0]["action"], "add-snapshot", "{updates}");
+        assert_eq!(updates[1]["action"], "set-snapshot-ref", "{updates}");
+        assert_eq!(updates[1]["ref-name"], "main");
         assert_eq!(
-            sent[0]["updates"],
-            serde_json::json!([{"action": "remove-snapshot-ref", "ref-name": "main"}])
+            updates[1]["snapshot-id"],
+            updates[0]["snapshot"]["snapshot-id"]
         );
     }
 
