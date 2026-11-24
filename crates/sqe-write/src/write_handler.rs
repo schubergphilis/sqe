@@ -31,7 +31,7 @@ use sqe_core::{Session, SqeConfig, SqeError, SqeErrorCode};
 use tracing::instrument;
 
 use crate::commit::{commit_with_retry, is_conflict_message};
-use crate::ident::{catalog_qualifier, fold_unquoted_ident, parse_table_ref};
+use crate::ident::{catalog_qualifier, fold_unquoted_ident, resolve_table_ident};
 use crate::writer::{
     new_upload_tracker, project_to_identifier_columns, resolve_write_compression,
     write_data_files_streaming_with_metrics, write_data_files_with_metrics,
@@ -666,29 +666,6 @@ fn build_arrow_schema_for_table(table: &IcebergTable) -> sqe_core::Result<Arc<Ar
     let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Iceberg -> Arrow schema: {e}")))?;
     Ok(Arc::new(arrow_schema))
-}
-
-/// Resolve a table reference to a `TableIdent`, honoring the session schema
-/// (X-Trino-Schema) for an unqualified 1-part name.
-///
-/// `parse_table_ref` defaults an unqualified name to the `default` namespace.
-/// The read path and Trino instead resolve `t` against the session's default
-/// schema, so a `CREATE TABLE new (LIKE nation)` issued with
-/// `X-Trino-Schema: tpch_demo` must look for `tpch_demo.nation`, not
-/// `default.nation`. A 2- or 3-part name already names its namespace and is
-/// returned unchanged.
-fn resolve_table_ident(name: &ObjectName, session: &Session) -> sqe_core::Result<TableIdent> {
-    let ident = parse_table_ref(name)?;
-    let is_unqualified = name.0.iter().filter_map(|p| p.as_ident()).count() == 1;
-    if is_unqualified {
-        if let Some(schema) = session.default_schema.as_deref().filter(|s| !s.is_empty()) {
-            return Ok(TableIdent::new(
-                NamespaceIdent::new(schema.to_string()),
-                ident.name().to_string(),
-            ));
-        }
-    }
-    Ok(ident)
 }
 
 /// Alias used inside the policy subquery to expose the stored value of a
@@ -2248,6 +2225,8 @@ impl WriteHandler {
         // this on every run after the first (#897).
         if if_not_exists && session_catalog.table_exists(&table_ident).await? {
             info!(table = %table_ident, "Table already exists, skipping CTAS (IF NOT EXISTS)");
+            let parts = lineage_target_parts(&self.config, session, table_name, &table_ident);
+            *plan_out = Some(sqe_lineage::PlanOrHint::skipped_write(parts));
             return affected_rows_batch(0);
         }
 
@@ -15764,13 +15743,25 @@ s3_path_style = true
             let ident = rig.ident("cine");
             let before = rig.load(&ident).await;
 
-            let out = run_ctas(
-                &h,
-                &rig,
+            let stmt = parse_one(
                 "CREATE TABLE IF NOT EXISTS default.cine AS SELECT * FROM (VALUES (2, 'b')) AS s(id, v)",
-            )
-            .await;
+            );
+            let (sql, ctx, mut plan) = (ctas_select_sql(&stmt), DFSessionContext::new(), None);
+            let out = h
+                .handle_ctas_streaming(&rig.session(), &stmt, &ctx, &sql, &mut plan, &mut None)
+                .await
+                .expect("CTAS");
             assert_eq!(rows_affected(&out), 0);
+            // Lineage names the untouched target as skipped, with no plan.
+            let Some(sqe_lineage::PlanOrHint::Hint(sqe_lineage::LineageHint::SkippedWrite {
+                schema,
+                table,
+                ..
+            })) = plan
+            else {
+                panic!("skipped-write lineage hint");
+            };
+            assert_eq!((schema.as_str(), table.as_str()), ("default", "cine"));
             let after = rig.load(&ident).await;
             assert_eq!(
                 after.metadata().uuid(),

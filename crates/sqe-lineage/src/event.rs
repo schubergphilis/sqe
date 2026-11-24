@@ -143,6 +143,22 @@ pub struct DatasetFacets {
     /// committed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<DatasetVersionFacet>,
+    /// SQE-specific: the statement left this dataset as it was (a
+    /// `CREATE TABLE IF NOT EXISTS ... AS` on a table that exists). Such an
+    /// output never carries `lifecycleStateChange`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqe_skipped: Option<SkippedFacet>,
+}
+
+/// Custom dataset facet `sqe_skipped`: `{"reason": "table_exists"}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkippedFacet {
+    pub reason: String,
+}
+
+impl SkippedFacet {
+    /// The target of `CREATE TABLE IF NOT EXISTS ... AS` already existed.
+    pub const TABLE_EXISTS: &'static str = "table_exists";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

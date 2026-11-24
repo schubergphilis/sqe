@@ -1,0 +1,5 @@
+**STATUS 2026-11-24: a skipped CTAS IF NOT EXISTS names its target in lineage (`feat/lineage-skipped-ctas`).**
+
+`handle_ctas_streaming` now sets `LineageHint::SkippedWrite {catalog, schema, table}` (named by `lineage_target_parts`, as a real CTAS names its target) before returning 0 rows. The extractor turns it into one output with the dataset facet `sqe_skipped: {"reason": "table_exists"}` (`SkippedFacet`), no inputs and no column lineage, and `apply_lifecycle` passes over a `sqe_skipped` output, so the CTAS's `CREATE` lifecycle is not stamped on it. To fit `sqe-write` under its line budget, the private copy of `resolve_table_ident` in `write_handler.rs` was dropped for the identical `crate::ident` one. Tests: `skipped_ctas_names_the_target_with_sqe_skipped_and_no_lifecycle` (sqe-lineage IT, wire JSON) and `ctas_if_not_exists_skips_an_existing_table` (sqe-write, test-sqlite), both seen failing first. Not run: `make test-integration`.
+
+**NEXT:** CREATE / DROP / RENAME VIEW lineage events (options first where they change a published event shape).

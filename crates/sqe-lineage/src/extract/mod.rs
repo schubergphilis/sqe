@@ -49,8 +49,8 @@ pub fn extract_table_names(plan: &LogicalPlan) -> Vec<String> {
 use crate::event::{
     ColumnLineageEntry, ColumnLineageFacet, ColumnLineageInput, DataSourceFacet, DatasetFacets,
     DatasetVersionFacet, InputDataset, LifecycleStateChangeFacet, OutputDataset,
-    OutputDatasetFacets, PreviousIdentifier, SchemaFacet, SchemaField, SymlinkIdentifier,
-    SymlinksFacet,
+    OutputDatasetFacets, PreviousIdentifier, SchemaFacet, SchemaField, SkippedFacet,
+    SymlinkIdentifier, SymlinksFacet,
 };
 use crate::observer::{LineageHint, LineageScope};
 use datafusion::logical_expr::{DdlStatement, LogicalPlan};
@@ -344,9 +344,13 @@ fn build_column_lineage_facet(
 }
 
 /// Set the OL `lifecycleStateChange` facet (e.g. `CREATE` for a CTAS) on
-/// every output dataset.
+/// every output dataset the statement changed: a `sqe_skipped` output keeps
+/// none.
 pub fn apply_lifecycle(outputs: &mut [OutputDataset], change: &str) {
-    for out in outputs {
+    for out in outputs
+        .iter_mut()
+        .filter(|o| o.facets.sqe_skipped.is_none())
+    {
         out.facets.lifecycleStateChange = Some(LifecycleStateChangeFacet {
             lifecycleStateChange: change.to_string(),
             previousIdentifier: None,
@@ -442,6 +446,23 @@ pub fn extract_from_hint(
                 namespace: id.namespace,
                 name: id.name,
                 facets,
+                outputFacets: OutputDatasetFacets::default(),
+            };
+            (vec![], vec![output])
+        }
+        LineageHint::SkippedWrite {
+            catalog,
+            schema,
+            table,
+        } => {
+            let mut id = dataset_identity(lookup, catalog, schema, table);
+            id.facets.sqe_skipped = Some(SkippedFacet {
+                reason: SkippedFacet::TABLE_EXISTS.into(),
+            });
+            let output = OutputDataset {
+                namespace: id.namespace,
+                name: id.name,
+                facets: id.facets,
                 outputFacets: OutputDatasetFacets::default(),
             };
             (vec![], vec![output])

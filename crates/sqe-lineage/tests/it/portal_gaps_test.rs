@@ -307,6 +307,39 @@ async fn ctas_uses_one_namespace_and_marks_the_target_created() {
     assert_eq!(got["run"], run_json());
 }
 
+/// `CREATE TABLE IF NOT EXISTS ... AS` on an existing table changes nothing:
+/// the COMPLETE names the target with the `sqe_skipped` facet and carries no
+/// lifecycle (the statement's CREATE is not applied), inputs or column
+/// lineage, so a consumer retires nothing on it.
+#[tokio::test]
+async fn skipped_ctas_names_the_target_with_sqe_skipped_and_no_lifecycle() {
+    let parts = ("workspace1".into(), "default".into(), "lin_probe".into());
+    let mut ctx = complete(
+        "ctas",
+        "CREATE TABLE IF NOT EXISTS lin_probe AS SELECT 1 AS n",
+        Some(PlanOrHint::skipped_write(parts)),
+    );
+    ctx.output_lifecycle = Some(event::lifecycle::CREATE.into());
+    let got = emit(ctx).await;
+    let (data_source, symlinks) = identity("lin_probe");
+    assert_eq!(got["eventType"], "COMPLETE");
+    assert_eq!(got["inputs"], json!([]));
+    assert_eq!(
+        got["outputs"],
+        json!([{
+            "namespace": "sqe://workspace1",
+            "name": "default.lin_probe",
+            "facets": {
+                "dataSource": data_source,
+                "symlinks": symlinks,
+                "sqe_skipped": { "reason": "table_exists" }
+            },
+            "outputFacets": {}
+        }])
+    );
+    assert_eq!(got["run"], run_json());
+}
+
 #[tokio::test]
 async fn rename_emits_the_new_name_with_lifecycle_rename_and_the_old_name() {
     let hint = LineageHint::TableRename {
