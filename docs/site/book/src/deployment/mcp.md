@@ -490,6 +490,8 @@ for every column type the crawler meets: `Boolean`, `Int32`, `Int64`,
 `Utf8`, `Utf8View`, and `List` and `Struct` columns as well. Exact and
 approximate agreed to within 1 percent on the columns measured (for
 example 950,704 exact against 934,606 approximate on an `Int64` key).
+`Float32` and `Float64` columns work too, without a cast: every NaN counts
+as one value, and `-0.0` and `0.0` count as one, as in Trino.
 `approx_distinct` returns `UInt64`; `COUNT(DISTINCT)` returns `Int64`. One
 statement can carry both for several columns:
 
