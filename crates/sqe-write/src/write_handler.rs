@@ -40,6 +40,7 @@ use crate::writer::{
 use sqe_compaction::write_memory::{TrackedBatchBuffer, WriteReservation};
 
 mod ctas_replace;
+mod ctas_rollback;
 mod ingest;
 mod snapshot_props;
 mod table_props;
@@ -989,61 +990,6 @@ fn policy_projection_sql(
     Some(format!(
         "SELECT {projection_sql} FROM {scratch_table} AS \"{orig_alias}\""
     ))
-}
-
-/// Best-effort cleanup of a partially-created CTAS table.
-///
-/// The CTAS streaming path follows the same
-/// three-step pattern: (1) `catalog.create_table()` registers in Polaris and
-/// writes `metadata/00000-*.json`, (2) the write loop streams parquet to the
-/// table location, (3) a fast-append transaction commits the new snapshot. If
-/// step 2 or step 3 fails the catalog still has the registered (snapshot-less)
-/// entry and the S3 prefix is populated with one or both of:
-///
-///   - `metadata/00000-*.json` from step 1
-///   - `data/*.parquet` from step 2
-///
-/// Without rollback, the next CTAS targeting the same logical name hits
-/// Polaris's location-conflict check (the `metadata.json` already there) and
-/// returns 403 forever — until an operator runs `rm -rf` on S3 or
-/// `system.purge_orphan_locations` (when that lands). The morning of
-/// 2026-05-11 we observed this loop three times in a row across one dbt
-/// session.
-///
-/// This helper undoes step 1 + step 2: delete the S3 prefix, then drop the
-/// catalog entry. Both calls are best-effort and only warn on failure — the
-/// original error from the CTAS is what the caller propagates.
-async fn rollback_ctas_partial_create(
-    catalog: &Arc<dyn Catalog>,
-    table: &IcebergTable,
-    table_ident: &TableIdent,
-) {
-    let location = table.metadata().location();
-    let file_io = table.file_io();
-    match file_io.delete_prefix(location).await {
-        Ok(_) => info!(
-            table = %table_ident,
-            location,
-            "CTAS rollback: deleted S3 prefix"
-        ),
-        Err(e) => warn!(
-            table = %table_ident,
-            location,
-            error = %e,
-            "CTAS rollback: failed to delete S3 prefix — orphan data may remain"
-        ),
-    }
-    match catalog.drop_table(table_ident).await {
-        Ok(_) => info!(
-            table = %table_ident,
-            "CTAS rollback: dropped catalog entry"
-        ),
-        Err(e) => warn!(
-            table = %table_ident,
-            error = %e,
-            "CTAS rollback: failed to drop catalog entry — orphan registration may remain"
-        ),
-    }
 }
 
 /// Max attempts for a CoW UPDATE/DELETE that loses an optimistic-concurrency race.
@@ -2650,15 +2596,12 @@ impl WriteHandler {
         }
         .await;
 
-        if let Err(ref err) = post_create {
-            warn!(
-                table = %create_ident,
-                error = %err,
-                "CTAS (streaming) failed after create_table; rolling back to prevent orphan"
-            );
-            rollback_ctas_partial_create(&catalog, &table, &create_ident).await;
-        }
-        let (total_rows, snapshot_id) = post_create?;
+        let (total_rows, snapshot_id) = match post_create {
+            Ok(done) => done,
+            Err(err) => {
+                return Err(ctas_rollback::roll_back(&catalog, &table, &create_ident, err).await)
+            }
+        };
         record_lineage_snapshot(plan_out, snapshot_id);
 
         // The table exists and holds its data now: drop the caller's cached
