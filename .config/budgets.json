@@ -11,7 +11,7 @@
     "crates/sqe-coordinator/src/maintenance.rs": 5750,
     "crates/sqe-coordinator/src/maintenance_scheduler.rs": 4000,
     "crates/sqe-coordinator/src/query_handler.rs": 10450,
-    "crates/sqe-core/src/config/mod.rs": 10150,
+    "crates/sqe-core/src/config/mod.rs": 10200,
     "crates/sqe-mcp/src/lib.rs": 5750,
     "crates/sqe-policy/src/grants/ranger.rs": 4250,
     "crates/sqe-server/src/main.rs": 5250,
@@ -37,7 +37,7 @@
       ]
     },
     "sqe-catalog": {
-      "lines": 70700,
+      "lines": 70900,
       "deps": [
         "sqe-core",
         "sqe-geo",
@@ -67,7 +67,7 @@
       ]
     },
     "sqe-coordinator": {
-      "lines": 72300,
+      "lines": 72800,
       "deps": [
         "sqe-auth",
         "sqe-catalog",
@@ -88,7 +88,7 @@
       ]
     },
     "sqe-core": {
-      "lines": 27100,
+      "lines": 27400,
       "deps": []
     },
     "sqe-geo": {
@@ -130,7 +130,7 @@
       ]
     },
     "sqe-policy": {
-      "lines": 20750,
+      "lines": 21000,
       "deps": [
         "sqe-core",
         "sqe-metrics-core",

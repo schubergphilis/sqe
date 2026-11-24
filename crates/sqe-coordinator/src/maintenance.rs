@@ -2764,6 +2764,7 @@ impl MaintenanceHandler {
                     self.table_cache.as_ref(),
                     self.config.policy.inherit_schema_tags,
                     self.config.policy.inherit_catalog_tags,
+                    false,
                 )
                 .await
                 .map_err(|e| SqeError::Catalog(e.to_string()))?

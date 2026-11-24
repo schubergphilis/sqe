@@ -495,10 +495,73 @@ these catalogs.
 
 The identity belongs to the configured catalog, under its config name and its
 `warehouse` name; `select` is denied by default under both. A warehouse that
-`catalog_discovery = "polaris-auto"` finds is not configured, so it never
-inherits the engine identity, even when the template catalog has one. It reads
-with keys vended to the person's own token, so a person without storage access
-on that warehouse in Polaris cannot read it.
+`catalog_discovery = "polaris-auto"` finds is not configured, so by default it
+never inherits the engine identity, even when the template catalog has one. It
+reads with keys vended to the person's own token, so a person without storage
+access on that warehouse in Polaris cannot read it. The opt-in below changes
+that for warehouses you allowlist.
+
+### Engine reads for discovered warehouses
+
+Set `discovery_engine_read = "template"` to let a discovered warehouse read
+with the template catalog's engine `credentials`:
+
+```toml
+[query]
+catalog_discovery = "polaris-auto"
+discovery_engine_read = "template"            # default is "off"
+discovery_engine_warehouses = ["ws-*", "finance"]
+```
+
+The template is the default catalog when it is REST, else the first REST
+catalog. Before a discovered warehouse gets the engine identity, SQE proves it,
+in this order:
+
+1. The name matches an entry of `discovery_engine_warehouses`. An entry is an
+   exact name or a pattern where `*` stands for any run of characters.
+   Matching is case-sensitive.
+2. The name is not a configured catalog key, a configured `warehouse` name, a
+   Hive root, `system` or `datafusion`.
+3. The person's `GET /v1/config?warehouse=<name>` at the template's URL
+   succeeds.
+4. The engine's call succeeds too, and both answers carry the same
+   `overrides.prefix`. A missing prefix on either side proves nothing.
+
+Any failed step leaves the warehouse on the person's delegated keys, the same
+as `"off"`. A person who cannot reach the warehouse stops the proof at step 3,
+so the engine is never asked. Each proof writes one `Auth` audit event with
+`statement_type` `discovery_engine_proof`, naming the warehouse and, on a
+refusal, the step that refused it. Key fetches on a proved warehouse carry
+`discovered_engine_key_fetch`. With `"off"` no proof runs and no event is
+written. Two discovered warehouses share one engine token.
+
+The server does not start with `"template"` unless discovery is
+`polaris-auto`, the template sets `client_credentials` `credentials` and
+`require_vended_credentials = true`, `policy.engine = "ranger"` runs with
+`catalog_scoped = true`, and the allowlist is not empty.
+
+Ranger then denies `select` by default from startup on every catalog except
+these:
+
+- configured catalogs without `credentials`, under their config name and
+  their `warehouse` name;
+- Hive roots from the config file (a root attached at runtime is not exempt);
+- SQE's own namespaces: `datafusion`, `information_schema`, and the reserved
+  `system` schemas (`runtime`, `metadata`, `jdbc`, `information_schema`).
+
+A Polaris catalog named `system` stays governed for every other schema.
+Before you turn the opt-in on:
+
+- grant the engine principal `TABLE_READ_DATA` on each allowlisted warehouse,
+  and nothing that writes;
+- write the Ranger `select` policies for every warehouse people should read,
+  because a warehouse without one reads as empty;
+- give the engine token a scope that activates those grants, for example
+  `scope = "PRINCIPAL_ROLE:sqe_reader"` on Polaris. SQE sends the configured
+  scope as written.
+
+Writes, maintenance and DDL on a discovered warehouse keep the person's
+delegated keys in both modes.
 
 The engine principal is a service account: give it read-only privileges on the
 catalog (`TABLE_READ_DATA`, no write privileges) and keep its client secret
