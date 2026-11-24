@@ -160,6 +160,7 @@ impl QueryHandler {
         &self,
         session: &Session,
         stmt: &Statement,
+        captured_plan: &mut Option<sqe_lineage::PlanOrHint>,
     ) -> sqe_core::Result<()> {
         // CREATE MATERIALIZED VIEW is unsupported (#324); reject it rather than
         // silently creating a plain view that would never refresh.
@@ -168,8 +169,8 @@ impl QueryHandler {
                 "materialized views are not supported".to_string(),
             ));
         }
-        let query = match stmt {
-            Statement::CreateView(cv) => &cv.query,
+        let (query, cv) = match stmt {
+            Statement::CreateView(cv) => (&cv.query, cv),
             other => {
                 return Err(SqeError::with_code(
                     SqeErrorCode::ExecutionFailed,
@@ -180,7 +181,15 @@ impl QueryHandler {
 
         // Infer the output schema by planning the SELECT query through DataFusion
         let select_sql = format!("{query}");
-        let schema = self.get_schema(session, &select_sql).await?;
+        let mut body = None;
+        let schema = self
+            .get_schema_with_plan(session, &select_sql, &mut body)
+            .await?;
+        // Lineage: the view, its inputs and column lineage from the body as
+        // written. A view stores its definition, not the creator's view of
+        // the data, so the body is not policy-rewritten here.
+        *captured_plan =
+            body.map(|b| lineage_view_plan(&self.config, session, &cv.name, b, cv.or_replace));
 
         // Convert Arrow schema to Iceberg REST API schema format
         let schema_json = sqe_write::view_schema::arrow_schema_to_iceberg_json(&schema);

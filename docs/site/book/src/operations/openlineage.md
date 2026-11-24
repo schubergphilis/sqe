@@ -12,6 +12,8 @@ Use these events to drive a lineage UI (Marquez, DataHub) or to feed a metadata 
 | INSERT, CTAS, MERGE | always | yes | yes |
 | UPDATE, DELETE | always | yes | yes |
 | CREATE TABLE, ALTER, DROP | always | none | yes (with schema facet) |
+| CREATE VIEW | always | yes (tables the view body reads) | the view |
+| DROP VIEW | always | none | the view |
 | OPTIMIZE, VACUUM, REWRITE_MANIFESTS | never | n/a | n/a |
 
 Each query produces two events: a START at submit time and a COMPLETE on success or FAIL on error.
@@ -25,8 +27,43 @@ Inside a transaction, a write's START goes out when the statement runs, and its 
 - The output fields of INSERT, MERGE, UPDATE and DELETE are named after the target table's columns, by position.
 - `lifecycleStateChange` is `CREATE` for CREATE TABLE and CTAS, `OVERWRITE` for CREATE OR REPLACE and INSERT OVERWRITE, `TRUNCATE` for TRUNCATE, `DROP` for DROP TABLE, and `RENAME` for ALTER TABLE ... RENAME TO. A rename's output is the new name, and the facet's `previousIdentifier` holds the old `namespace` and `name`. A bare new name stays in the old table's schema.
 - A `CREATE TABLE IF NOT EXISTS ... AS` that finds the table already there writes nothing. Its COMPLETE event still names the table as the one output, with the custom dataset facet `sqe_skipped: {"reason": "table_exists"}`, no `lifecycleStateChange`, no inputs and no `columnLineage`. A consumer that sees `sqe_skipped` should not treat the event as a write.
+- A view is a dataset like a table, with the same namespace, name and `symlinks` identity. The view's output also carries the standard facet `datasetType: {"datasetType": "VIEW"}`; tables carry none. See [Views](#views).
 - An INSERT append or CTAS carries the committed Iceberg snapshot id as the `version` facet (`datasetVersion`). Other writes do not carry one yet. Inside a transaction the id is the head of the transaction's branch. `COMMIT` fast-forwards `main` to that head when it publishes a table without replaying the writes.
 - Every event carries the run facet `sqe_query` with `queryId`, equal to `runId`. For a statement over the Trino HTTP protocol, that is the query id the client polls.
+
+### Views
+
+CREATE VIEW names the view as its one output, with `lifecycleStateChange` `CREATE`, or `OVERWRITE` for CREATE OR REPLACE VIEW. The inputs are the tables the view body reads. The output has the body's schema and `columnLineage` from it, traced as for a CTAS. For `CREATE VIEW v_probe AS SELECT country, upper(segment) AS seg FROM customers` the output is:
+
+```json
+{
+  "namespace": "sqe://workspace1",
+  "name": "default.v_probe",
+  "facets": {
+    "schema": { "fields": [
+      { "name": "country", "type": "Utf8" },
+      { "name": "seg", "type": "Utf8" }
+    ]},
+    "dataSource": { "name": "workspace1", "uri": "<catalog uri>" },
+    "columnLineage": { "fields": {
+      "country": { "inputFields": [{ "namespace": "sqe://workspace1", "name": "default.customers", "field": "country",
+        "transformations": [{ "type": "DIRECT", "subtype": "IDENTITY", "description": "", "masking": false }] }] },
+      "seg": { "inputFields": [{ "namespace": "sqe://workspace1", "name": "default.customers", "field": "segment",
+        "transformations": [{ "type": "DIRECT", "subtype": "TRANSFORMATION", "description": "", "masking": false }] }] }
+    }},
+    "symlinks": { "identifiers": [{ "namespace": "<catalog uri>", "name": "workspace1.default.v_probe", "type": "TABLE" }] },
+    "lifecycleStateChange": { "lifecycleStateChange": "CREATE" },
+    "datasetType": { "datasetType": "VIEW" }
+  },
+  "outputFacets": {}
+}
+```
+
+The view body is traced as written, before any row filter or column mask. A view stores its definition, not the creator's view of the data, so the `columnLineage` of a view shows no `MASKED` transformations and the run carries no masking record.
+
+DROP VIEW names the first view it drops as its one output, with no inputs, `lifecycleStateChange` `DROP` and `datasetType` `VIEW`. `DROP VIEW IF EXISTS` of a missing view still emits it, as DROP TABLE does. The output carries `dataSource`, `symlinks`, `lifecycleStateChange` and `datasetType`, and no schema.
+
+ALTER VIEW ... RENAME TO is not emitted yet.
 
 ## Configuration
 
@@ -119,5 +156,5 @@ Two properties of the `columnLineage` facet matter to a governance tool that pro
 - `auth_mode = "user_token"` is rejected at startup. Lineage events do not carry session credentials. To authenticate to a collector, use `auth_mode = "bearer"` with a dedicated collector `api_key`; migrate any previous `user_token` configuration to this explicit mode.
 - Maintenance procedures (OPTIMIZE, VACUUM, REWRITE_MANIFESTS) are never emitted.
 - MERGE column-level lineage is emitted at the dataset level; per-branch annotations (MERGE_INSERT vs MERGE_UPDATE) are deferred until DataFusion exposes a Merge LogicalPlan node.
-- DDL paths (CREATE TABLE, DROP, etc.) emit events with `plan = None`. The dataset target is captured but column lineage is empty for DDL.
+- DDL paths other than CTAS and CREATE VIEW (CREATE TABLE, DROP, etc.) emit events with `plan = None`. The dataset target is captured but column lineage is empty for them.
 - Embedded CLI (`sqe-cli` ad-hoc mode) does not emit lineage. Production server (`sqe-server`) is the only emit path.

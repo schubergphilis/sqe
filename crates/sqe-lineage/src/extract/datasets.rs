@@ -99,7 +99,10 @@ pub fn extract_outputs(
 
         if let Some(name) = target_name {
             if let Some((catalog, schema, table)) = parse_table_ref(&name, scope) {
-                let id = dataset_identity(lookup, &catalog, &schema, &table);
+                let mut id = dataset_identity(lookup, &catalog, &schema, &table);
+                if matches!(node, LogicalPlan::Ddl(DdlStatement::CreateView(_))) {
+                    id.facets.datasetType = Some(crate::event::DatasetTypeFacet::view());
+                }
                 out.push(OutputDataset {
                     namespace: id.namespace,
                     name: id.name,
