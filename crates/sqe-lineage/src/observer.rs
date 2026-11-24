@@ -51,6 +51,14 @@ pub enum LineageHint {
         previous_schema: String,
         previous_table: String,
     },
+    /// A write that changed nothing: `CREATE TABLE IF NOT EXISTS ... AS` on
+    /// a table that exists. The table is the one output, marked with the
+    /// `sqe_skipped` facet; no lifecycle change, inputs or column lineage.
+    SkippedWrite {
+        catalog: String,
+        schema: String,
+        table: String,
+    },
 }
 
 /// The session scope a statement was planned in: the catalog and schema
@@ -77,6 +85,17 @@ impl Default for LineageScope {
 pub enum PlanOrHint {
     Plan(Box<LogicalPlan>),
     Hint(LineageHint),
+}
+
+impl PlanOrHint {
+    /// [`LineageHint::SkippedWrite`] for `(catalog, schema, table)`.
+    pub fn skipped_write((catalog, schema, table): (String, String, String)) -> Self {
+        Self::Hint(LineageHint::SkippedWrite {
+            catalog,
+            schema,
+            table,
+        })
+    }
 }
 
 pub struct QueryStartCtx {
