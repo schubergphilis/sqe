@@ -1435,7 +1435,9 @@ macro_rules! dispatch_catalog {
 pub(crate) use dispatch_catalog;
 
 mod catalog_properties;
+mod config_probe;
 mod engine_credentials;
+pub use config_probe::warehouse_config_prefix;
 pub use engine_credentials::VendedKeys;
 
 /// Per-session Iceberg REST catalog wrapper.

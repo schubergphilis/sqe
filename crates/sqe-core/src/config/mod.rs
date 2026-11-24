@@ -7,6 +7,7 @@ use crate::SecretString;
 
 mod auth;
 mod catalog_scope;
+mod discovery_engine;
 mod engine_credentials;
 mod env_overlay;
 mod hive;
@@ -19,6 +20,7 @@ mod tvf_policy;
 
 pub use auth::{AuthConfig, AuthProviderConfig, ExternalAuthConfig};
 pub use catalog_scope::{CatalogScopeConfig, CatalogScopeMode, DEFAULT_CATALOG_SCOPE_HEADER};
+pub use discovery_engine::{warehouse_pattern_matches, DiscoveryEngineRead};
 pub use hive::{HiveConfig, HiveRootConfig, HiveRootKind};
 pub use hive_data::{
     configured_hive_prefixes, hive_tvf_overlaps, prefixes_overlap, protect_hive_data_prefixes,
@@ -327,6 +329,13 @@ pub struct QueryConfig {
     /// bearer. See `docs/superpowers/specs/2026-05-29-polaris-catalog-discovery-design.md`.
     #[serde(default)]
     pub catalog_discovery: CatalogDiscovery,
+    /// Discovered warehouses read with the template's engine credentials
+    /// (`"template"`) or the person's keys (`"off"`, default).
+    #[serde(default)]
+    pub discovery_engine_read: DiscoveryEngineRead,
+    /// Warehouses (exact names or `*` globs) that may use the engine read.
+    #[serde(default)]
+    pub discovery_engine_warehouses: Vec<String>,
     /// Maximum query execution time in seconds. Default: 300 (5 minutes).
     #[serde(default = "default_query_timeout")]
     pub timeout_secs: u64,
@@ -650,6 +659,8 @@ impl Default for QueryConfig {
         Self {
             default_catalog: None,
             catalog_discovery: CatalogDiscovery::default(),
+            discovery_engine_read: DiscoveryEngineRead::default(),
+            discovery_engine_warehouses: Vec::new(),
             timeout_secs: default_query_timeout(),
             role_overrides: std::collections::HashMap::new(),
             max_result_rows: default_max_result_rows(),
@@ -4416,6 +4427,7 @@ impl SqeConfig {
         }
         self.validate_ticket_keys(&mut errors);
         self.validate_engine_credentials(&mut errors);
+        self.validate_discovery_engine(&mut errors);
         // A per-catalog TVF prefix that cannot match anything is a typo, not
         // a policy: fail here rather than skip it silently at query time.
         let mut catalogs: Vec<(String, &CatalogConfig)> = self

@@ -313,7 +313,7 @@ pub struct RangerStore {
     /// Catalogs read with the engine's keys (`[catalogs.*] credentials`,
     /// #934). Tables under them need a Ranger `select` grant: without one the
     /// person gets no rows, and the engine fetches no keys.
-    engine_catalogs: HashSet<String>,
+    engine_catalogs: EngineCatalogs,
     /// Tag definition names from `GET /service/tags/tagdefs`, for
     /// `[access_control] tag_names = "ranger-tagdefs"`. Same TTL as the bundle;
     /// a fetch error is never cached.
@@ -392,7 +392,7 @@ impl RangerStore {
             hive_catalogs: Arc::new(HiveCatalogs::new()),
             hive_access_policies: cfg.hive_access_policies,
             catalog_scoped: cfg.catalog_scoped,
-            engine_catalogs: HashSet::new(),
+            engine_catalogs: EngineCatalogs::default(),
             tagdef_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(cfg.cache_ttl_secs))
                 .max_capacity(1)
@@ -455,7 +455,7 @@ impl RangerStore {
     /// the policy namespace starts with a registered Hive root name.
     fn requires_access_grant(&self, namespace: &str) -> bool {
         let first = namespace.split('.').next();
-        self.under_engine_catalog(first)
+        self.under_engine_catalog(namespace)
             || (self.hive_access_policies && self.hive_catalogs.contains_name(first))
     }
 
@@ -2584,6 +2584,7 @@ impl PolicyStore for RangerStore {
 
 mod conflict_principals;
 mod engine_catalogs;
+pub use engine_catalogs::EngineCatalogs;
 
 #[cfg(test)]
 mod tests;

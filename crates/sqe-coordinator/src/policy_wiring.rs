@@ -12,6 +12,7 @@ use sqe_core::config::{PolicyConfig, PolicyEngine};
 use sqe_core::SqeConfig;
 use sqe_policy::grants::{polaris::PolarisGrantBackend, ranger::RangerGrantBackend, GrantBackend};
 use sqe_policy::plan_rewriter::PolicyPlanRewriter;
+pub use sqe_policy::ranger_store::EngineCatalogs;
 use sqe_policy::{PassthroughEnforcer, PolicyEnforcer, PolicyStore};
 
 /// Construct the policy enforcer and (optionally) the backing store.
@@ -46,15 +47,35 @@ pub fn build_policy_enforcer(
         hive_catalogs,
         hive_manifest_cache,
         metrics,
-        Vec::new(),
+        EngineCatalogs::default(),
     )
+}
+
+/// The catalogs the Ranger store default-denies `select` on. Off: the
+/// configured catalogs with engine credentials. With
+/// `discovery_engine_read = "template"`: every catalog except the configured
+/// ones without credentials, since a discovered warehouse may read with the
+/// template's keys under any name.
+pub fn engine_catalogs_for(config: &SqeConfig) -> EngineCatalogs {
+    match config.query.discovery_engine_read {
+        sqe_core::config::DiscoveryEngineRead::Off => {
+            EngineCatalogs::Listed(config.engine_read_catalog_names().into_iter().collect())
+        }
+        sqe_core::config::DiscoveryEngineRead::Template => EngineCatalogs::AllExcept(
+            config
+                .discovery_engine_open_catalogs()
+                .into_iter()
+                .collect(),
+        ),
+    }
 }
 
 /// [`build_policy_enforcer`] for a deployment where some catalogs read with
 /// the engine's keys (`[catalogs.*] credentials`, #934). `engine_catalogs`
-/// names them; the Ranger store default-denies `select` on their tables, so
-/// a table with no policy answers with no rows and the engine fetches no
-/// keys for it.
+/// names them, or (with `discovery_engine_read = "template"`) names the only
+/// catalogs that stay open; the Ranger store default-denies `select` on the
+/// others' tables, so a table with no policy answers with no rows and the
+/// engine fetches no keys for it.
 #[allow(clippy::type_complexity)]
 pub fn build_policy_enforcer_with_engine_catalogs(
     config: &PolicyConfig,
@@ -62,7 +83,7 @@ pub fn build_policy_enforcer_with_engine_catalogs(
     hive_catalogs: Arc<sqe_policy::plan_rewriter::HiveCatalogs>,
     hive_manifest_cache: Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
-    engine_catalogs: Vec<String>,
+    engine_catalogs: EngineCatalogs,
 ) -> anyhow::Result<(Arc<dyn PolicyEnforcer>, Option<Arc<dyn PolicyStore>>)> {
     let mask_key: Option<Arc<Vec<u8>>> = if config.mask_key.is_empty() {
         None
@@ -113,7 +134,15 @@ pub fn build_policy_enforcer_with_engine_catalogs(
                 // sidecar warehouse), so it needs the same live root registry
                 // the rewriter keys policies with.
                 .with_hive_catalogs(hive_catalogs.clone())
-                .with_engine_catalogs(engine_catalogs);
+                .with_engine_catalogs(engine_catalogs.clone());
+            if let EngineCatalogs::AllExcept(open) = &engine_catalogs {
+                tracing::info!(
+                    mode = engine_catalogs.mode(),
+                    open = ?open,
+                    "Ranger default-denies `select` on every catalog except these and \
+                     SQE's virtual schemas ([query] discovery_engine_read = \"template\")"
+                );
+            }
             if store.enforces_hive_access() {
                 tracing::info!(
                     "Ranger access policies gate Hive-root tables: a table with no `select` \
@@ -254,6 +283,50 @@ pub fn build_grant_backend(config: &SqeConfig) -> anyhow::Result<Option<Arc<dyn 
 mod tests {
     use super::*;
     use sqe_core::config::{PolicyConfig, PolicyEngine};
+
+    /// Off lists the catalogs with engine credentials; Template denies every
+    /// catalog except the configured ones without them.
+    #[test]
+    fn engine_catalogs_follow_discovery_engine_read() {
+        let mut config = SqeConfig::embedded_defaults();
+        let mut engine = config.catalog.clone();
+        engine.warehouse = "engine_wh".into();
+        engine.credentials = Some(sqe_core::config::CatalogAuthConfig::ClientCredentials {
+            token_endpoint: "http://idp/token".into(),
+            client_id: "sqe-engine".into(),
+            client_secret: "s".into(),
+            client_secret_file: None,
+            scope: None,
+        });
+        config.catalogs.insert("engine".into(), engine);
+        let mut open = config.catalog.clone();
+        open.warehouse = "open_wh".into();
+        config.catalogs.insert("open".into(), open);
+
+        let EngineCatalogs::Listed(listed) = engine_catalogs_for(&config) else {
+            panic!("off lists the engine catalogs");
+        };
+        assert!(listed.contains("engine"), "{listed:?}");
+        assert!(!listed.contains("open"), "{listed:?}");
+
+        config.query.discovery_engine_read = sqe_core::config::DiscoveryEngineRead::Template;
+        let EngineCatalogs::AllExcept(except) = engine_catalogs_for(&config) else {
+            panic!("template denies all but the open catalogs");
+        };
+        assert!(
+            except.contains("open") && except.contains("open_wh"),
+            "{except:?}"
+        );
+        assert!(
+            !except.contains("engine") && !except.contains("engine_wh"),
+            "{except:?}"
+        );
+        let expected: std::collections::HashSet<String> = config
+            .discovery_engine_open_catalogs()
+            .into_iter()
+            .collect();
+        assert_eq!(except, expected);
+    }
 
     /// Fresh, empty Hive registries. Every test here is Iceberg-only, so an
     /// empty `HiveCatalogs` must leave `build_policy_enforcer`'s behavior

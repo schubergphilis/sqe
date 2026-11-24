@@ -124,6 +124,7 @@ pub(crate) async fn build_catalog_provider(
     degrade_unresolvable: bool,
     inherit_schema_tags: bool,
     inherit_catalog_tags: bool,
+    discovered: bool,
 ) -> Result<(SqeCatalogProvider, Arc<SessionCatalog>), Arc<SqeError>> {
     let (session_catalog, storage) = build_session_catalog(
         cat_cfg,
@@ -133,6 +134,7 @@ pub(crate) async fn build_catalog_provider(
         table_cache,
         inherit_schema_tags,
         inherit_catalog_tags,
+        discovered,
     )
     .await?;
 
@@ -170,6 +172,11 @@ pub(crate) async fn build_catalog_provider(
 ///
 /// `inherit_schema_tags` is `policy.inherit_schema_tags` (#924): the catalog
 /// then reads the namespace's schema tags next to each table it loads.
+///
+/// `discovered` marks a warehouse built from the discovery template; with
+/// engine credentials (only after the discovery proof) its key-fetch audit
+/// events say so.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_session_catalog(
     cat_cfg: &sqe_core::config::CatalogConfig,
     sql_name: &str,
@@ -178,6 +185,7 @@ pub(crate) async fn build_session_catalog(
     table_cache: Option<&TableMetadataCache>,
     inherit_schema_tags: bool,
     inherit_catalog_tags: bool,
+    discovered: bool,
 ) -> Result<(Arc<SessionCatalog>, sqe_core::config::StorageConfig), Arc<SqeError>> {
     session.check_catalog_read(sql_name).map_err(Arc::new)?;
     let auth = cat_cfg.auth.clone().unwrap_or_default();
@@ -203,6 +211,7 @@ pub(crate) async fn build_session_catalog(
         cat_cfg.credentials.as_ref(),
         sql_name,
         session,
+        discovered,
     )
     .map_err(Arc::new)?
     {
@@ -595,6 +604,7 @@ pub async fn create_session_context(
                     true,
                     config.policy.inherit_schema_tags,
                     config.policy.inherit_catalog_tags,
+                    false,
                 )
                 .await?;
                 if catalog_provider.listing_succeeded() && catalog_auth_is_per_user(cat_cfg) {
@@ -1242,6 +1252,11 @@ pub(crate) async fn discover_catalog_provider(
     }
     let mut cfg = discovery_template(config)?;
     cfg.warehouse = warehouse.to_string();
+    // `discovery_engine_read = "template"`: the template's engine
+    // credentials, only after the warehouse passed the proof. Any refusal,
+    // and "off", keep the person's delegated keys (credentials stay cleared).
+    cfg.credentials =
+        crate::discovery_engine::engine_credentials_for(warehouse, config, &cfg, session).await;
 
     match build_catalog_provider(
         &cfg,
@@ -1257,6 +1272,7 @@ pub(crate) async fn discover_catalog_provider(
         false,
         config.policy.inherit_schema_tags,
         config.policy.inherit_catalog_tags,
+        true,
     )
     .await
     {
@@ -1311,6 +1327,7 @@ pub(crate) async fn configured_session_catalog(
         table_cache,
         config.policy.inherit_schema_tags,
         config.policy.inherit_catalog_tags,
+        false,
     )
     .await
     {
@@ -1380,6 +1397,9 @@ pub(crate) async fn discover_session_catalog(
         table_cache,
         config.policy.inherit_schema_tags,
         config.policy.inherit_catalog_tags,
+        // Writes never carry engine credentials, so nothing is audited as
+        // a discovered key fetch.
+        false,
     )
     .await
     {
