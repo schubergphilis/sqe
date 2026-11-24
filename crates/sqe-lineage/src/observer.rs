@@ -41,6 +41,16 @@ pub enum LineageHint {
         table: String,
         change: String,
     },
+    /// `ALTER TABLE ... RENAME TO`: the table under its new name is the one
+    /// output dataset, with `lifecycleStateChange: RENAME` and the old name
+    /// as `previousIdentifier`. A rename never leaves its catalog.
+    TableRename {
+        catalog: String,
+        schema: String,
+        table: String,
+        previous_schema: String,
+        previous_table: String,
+    },
 }
 
 /// The session scope a statement was planned in: the catalog and schema

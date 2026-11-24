@@ -2337,6 +2337,8 @@ impl QueryHandler {
                             0,
                         )?;
                     }
+                    // Recorded first, so a failed rename's FAIL event names it.
+                    captured_plan = lineage_rename_hint(&self.config, session, stmt);
                     // Cross-user: the table name itself changes; other users'
                     // SessionContexts hold the old name in their catalog
                     // provider's cached namespace listings.
@@ -7328,6 +7330,30 @@ fn lineage_lifecycle_hint(
         table,
         change: change.to_string(),
     })
+}
+
+/// Rename hint: new name, old one as `previousIdentifier`; a bare new name keeps the schema.
+fn lineage_rename_hint(
+    c: &SqeConfig,
+    s: &Session,
+    stmt: &Statement,
+) -> Option<sqe_lineage::PlanOrHint> {
+    let (old, new) = sqe_sql::metadata::rename_names(stmt)?;
+    let (catalog, previous_schema, previous_table) = lineage_table(c, s, old);
+    let (_, schema, table) = lineage_table(c, s, new);
+    let schema = if new.0.len() > 1 {
+        schema
+    } else {
+        previous_schema.clone()
+    };
+    let hint = sqe_lineage::LineageHint::TableRename {
+        catalog,
+        schema,
+        table,
+        previous_schema,
+        previous_table,
+    };
+    Some(sqe_lineage::PlanOrHint::Hint(hint))
 }
 
 /// OL lifecycle change a write statement makes to its output dataset, decided

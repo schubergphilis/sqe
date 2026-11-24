@@ -163,11 +163,23 @@ pub mod lifecycle {
     pub const DROP: &str = "DROP";
     pub const OVERWRITE: &str = "OVERWRITE";
     pub const TRUNCATE: &str = "TRUNCATE";
+    pub const RENAME: &str = "RENAME";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LifecycleStateChangeFacet {
     pub lifecycleStateChange: String,
+    /// The dataset's identity before a `RENAME`; absent for every other
+    /// change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previousIdentifier: Option<PreviousIdentifier>,
+}
+
+/// OL `previousIdentifier` of a renamed dataset.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreviousIdentifier {
+    pub namespace: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

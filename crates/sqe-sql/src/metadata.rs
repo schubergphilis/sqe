@@ -222,6 +222,20 @@ pub fn update_type(stmt: &Statement) -> Option<UpdateType> {
     })
 }
 
+/// The old and new name of `ALTER TABLE <old> RENAME {TO|AS} <new>`.
+pub fn rename_names(stmt: &Statement) -> Option<(&ObjectName, &ObjectName)> {
+    use sqlparser::ast::{AlterTableOperation::RenameTable, RenameTableNameKind as Kind};
+    let Statement::AlterTable(alter) = stmt else {
+        return None;
+    };
+    alter.operations.iter().find_map(|op| match op {
+        RenameTable {
+            table_name: Kind::As(new) | Kind::To(new),
+        } => Some((&alter.name, new)),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +375,17 @@ mod tests {
         );
         assert_eq!(update_type(&parse("SELECT 1")), None);
         assert_eq!(update_type(&parse("SHOW TABLES")), None);
+    }
+
+    #[test]
+    fn rename_names_reads_old_and_new() {
+        let stmt = parse("ALTER TABLE s.old RENAME TO s2.new");
+        let (old, new) = rename_names(&stmt).expect("rename");
+        assert_eq!(
+            (old.to_string(), new.to_string()),
+            ("s.old".into(), "s2.new".into())
+        );
+        assert!(rename_names(&parse("ALTER TABLE t ADD COLUMN c INT")).is_none());
+        assert!(rename_names(&parse("SELECT 1")).is_none());
     }
 }

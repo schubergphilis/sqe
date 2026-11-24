@@ -1,0 +1,5 @@
+**STATUS 2026-11-24: ALTER TABLE ... RENAME TO emits a lineage run (`feat/lineage-rename-event`).**
+
+The output dataset is the new name with `lifecycleStateChange: RENAME` and `previousIdentifier {namespace, name}` for the old one (OpenLineage `LifecycleStateChangeDatasetFacet`). The hint is `LineageHint::TableRename`, built in the coordinator's rename arm from `sqe_sql::metadata::rename_names`; a one-part new name keeps the old schema. `previousIdentifier` is skipped when empty, so CREATE / OVERWRITE / TRUNCATE / DROP events serialise as before. Tests: `rename_names_reads_old_and_new` (sqe-sql), `rename_hint_emits_the_new_name_with_the_previous_identifier` (sqe-lineage unit), `rename_emits_the_new_name_with_lifecycle_rename_and_the_old_name` (sqe-lineage IT, wire JSON). The coordinator arm has no test of its own: `sqe-coordinator` is at 72793 / 72800 lines. Not run: `make test-integration`.
+
+**NEXT:** COMPLETE event for a skipped CTAS (target as output, facet flag), then CREATE / DROP / RENAME VIEW lineage events.
