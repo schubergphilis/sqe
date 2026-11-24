@@ -308,6 +308,46 @@ async fn ctas_uses_one_namespace_and_marks_the_target_created() {
 }
 
 #[tokio::test]
+async fn rename_emits_the_new_name_with_lifecycle_rename_and_the_old_name() {
+    let hint = LineageHint::TableRename {
+        catalog: "workspace1".into(),
+        schema: "default".into(),
+        table: "lin_probe".into(),
+        previous_schema: "default".into(),
+        previous_table: "lin_old".into(),
+    };
+    let got = emit(complete(
+        "rename",
+        "ALTER TABLE lin_old RENAME TO lin_probe",
+        Some(PlanOrHint::Hint(hint)),
+    ))
+    .await;
+    let (data_source, symlinks) = identity("lin_probe");
+    assert_eq!(got["eventType"], "COMPLETE");
+    assert_eq!(got["inputs"], json!([]));
+    assert_eq!(
+        got["outputs"],
+        json!([{
+            "namespace": "sqe://workspace1",
+            "name": "default.lin_probe",
+            "facets": {
+                "dataSource": data_source,
+                "symlinks": symlinks,
+                "lifecycleStateChange": {
+                    "lifecycleStateChange": "RENAME",
+                    "previousIdentifier": {
+                        "namespace": "sqe://workspace1",
+                        "name": "default.lin_old"
+                    }
+                }
+            },
+            "outputFacets": {}
+        }])
+    );
+    assert_eq!(got["run"], run_json());
+}
+
+#[tokio::test]
 async fn drop_emits_the_dropped_table_with_lifecycle_drop() {
     let hint = LineageHint::TableLifecycle {
         catalog: "workspace1".into(),

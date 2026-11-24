@@ -49,7 +49,8 @@ pub fn extract_table_names(plan: &LogicalPlan) -> Vec<String> {
 use crate::event::{
     ColumnLineageEntry, ColumnLineageFacet, ColumnLineageInput, DataSourceFacet, DatasetFacets,
     DatasetVersionFacet, InputDataset, LifecycleStateChangeFacet, OutputDataset,
-    OutputDatasetFacets, SchemaFacet, SchemaField, SymlinkIdentifier, SymlinksFacet,
+    OutputDatasetFacets, PreviousIdentifier, SchemaFacet, SchemaField, SymlinkIdentifier,
+    SymlinksFacet,
 };
 use crate::observer::{LineageHint, LineageScope};
 use datafusion::logical_expr::{DdlStatement, LogicalPlan};
@@ -348,6 +349,7 @@ pub fn apply_lifecycle(outputs: &mut [OutputDataset], change: &str) {
     for out in outputs {
         out.facets.lifecycleStateChange = Some(LifecycleStateChangeFacet {
             lifecycleStateChange: change.to_string(),
+            previousIdentifier: None,
         });
     }
 }
@@ -419,6 +421,31 @@ pub fn extract_from_hint(
             apply_lifecycle(&mut outputs, change);
             (vec![], outputs)
         }
+        LineageHint::TableRename {
+            catalog,
+            schema,
+            table,
+            previous_schema,
+            previous_table,
+        } => {
+            let id = dataset_identity(lookup, catalog, schema, table);
+            let previous = dataset_identity(lookup, catalog, previous_schema, previous_table);
+            let mut facets = id.facets;
+            facets.lifecycleStateChange = Some(LifecycleStateChangeFacet {
+                lifecycleStateChange: crate::event::lifecycle::RENAME.to_string(),
+                previousIdentifier: Some(PreviousIdentifier {
+                    namespace: previous.namespace,
+                    name: previous.name,
+                }),
+            });
+            let output = OutputDataset {
+                namespace: id.namespace,
+                name: id.name,
+                facets,
+                outputFacets: OutputDatasetFacets::default(),
+            };
+            (vec![], vec![output])
+        }
     }
 }
 
@@ -474,5 +501,30 @@ mod hint_tests {
             "DROP"
         );
         assert!(outputs[0].facets.schema.is_none());
+    }
+
+    #[test]
+    fn rename_hint_emits_the_new_name_with_the_previous_identifier() {
+        let hint = LineageHint::TableRename {
+            catalog: "workspace1".into(),
+            schema: "sales".into(),
+            table: "orders_v2".into(),
+            previous_schema: "default".into(),
+            previous_table: "orders".into(),
+        };
+        let (inputs, outputs) = extract_from_hint(&hint, &lookup());
+        assert!(inputs.is_empty());
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].namespace, "sqe://workspace1");
+        assert_eq!(outputs[0].name, "sales.orders_v2");
+        let change = outputs[0].facets.lifecycleStateChange.as_ref().unwrap();
+        assert_eq!(change.lifecycleStateChange, lifecycle::RENAME);
+        assert_eq!(
+            change.previousIdentifier,
+            Some(PreviousIdentifier {
+                namespace: "sqe://workspace1".into(),
+                name: "default.orders".into(),
+            })
+        );
     }
 }

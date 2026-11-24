@@ -23,7 +23,7 @@ Inside a transaction, a write's START goes out when the statement runs, and its 
 - Every input and output dataset has namespace `sqe://<catalog>` and name `<schema>.<table>`, where `<catalog>` is the Iceberg catalog the table was read from or written to. A REST catalog is named after its warehouse. An unqualified or two-part table name resolves in the statement's session catalog and schema.
 - Each dataset carries a `symlinks` facet with a `TABLE` identifier: namespace is the catalog URI and name is `<catalog>.<schema>.<table>`. `dataSource` keeps the catalog URI.
 - The output fields of INSERT, MERGE, UPDATE and DELETE are named after the target table's columns, by position.
-- `lifecycleStateChange` is `CREATE` for CREATE TABLE and CTAS, `OVERWRITE` for CREATE OR REPLACE and INSERT OVERWRITE, `TRUNCATE` for TRUNCATE, and `DROP` for DROP TABLE.
+- `lifecycleStateChange` is `CREATE` for CREATE TABLE and CTAS, `OVERWRITE` for CREATE OR REPLACE and INSERT OVERWRITE, `TRUNCATE` for TRUNCATE, `DROP` for DROP TABLE, and `RENAME` for ALTER TABLE ... RENAME TO. A rename's output is the new name, and the facet's `previousIdentifier` holds the old `namespace` and `name`. A bare new name stays in the old table's schema.
 - An INSERT append or CTAS carries the committed Iceberg snapshot id as the `version` facet (`datasetVersion`). Other writes do not carry one yet. Inside a transaction the id is the head of the transaction's branch. `COMMIT` fast-forwards `main` to that head when it publishes a table without replaying the writes.
 - Every event carries the run facet `sqe_query` with `queryId`, equal to `runId`. For a statement over the Trino HTTP protocol, that is the query id the client polls.
 
