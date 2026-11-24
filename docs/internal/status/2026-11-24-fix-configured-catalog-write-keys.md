@@ -1,0 +1,5 @@
+**STATUS 2026-11-24: write targets in a named engine-credentials catalog load on the person's keys (`fix/configured-catalog-write-keys`, #934).**
+
+The roadmap item "dbt MERGE read keys" was checked against the code. The MERGE source runs through the normal query path, so it already reads with engine keys like a plain SELECT; that reading of the item does not hold. The real gap was the target: `CatalogDiscovery::configured_session_catalog` returned a `[catalogs.<name>]` catalog in engine mode, UPDATE / DELETE / MERGE load their target with `load_table`, and `check_write_access` refuses an engine-keyed table. It failed closed, so every such write was refused, also for writers (dbt incremental MERGE included). The coordinator's hook now hands back the delegated write view (`SessionCatalog::shared_write_catalog`). The legacy `[catalog]` block already took `into_write_catalog`, which is why the stack e2e (`engine_credential_e2e`) never showed it. Test: `configured_write_keys` in `sqe-coordinator/tests/it`, wiremock, no stack. The Polaris stack suite was not run.
+
+**NEXT:** rename COMPLETE event carrying RENAME and previousIdentifier.

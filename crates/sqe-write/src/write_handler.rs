@@ -1379,8 +1379,9 @@ pub trait CatalogDiscovery: Send + Sync {
     ) -> Option<Arc<SessionCatalog>>;
 
     /// Build the session catalog of the `[catalogs.<name>]` entry, from that
-    /// entry's own endpoint, warehouse, auth and storage, as SELECT does.
-    /// `None` when it does not build for this session.
+    /// entry's own endpoint, warehouse, auth and storage, as SELECT does, on
+    /// the person's delegated keys even when the entry reads with engine
+    /// credentials. `None` when it does not build for this session.
     async fn configured_session_catalog(
         &self,
         name: &str,
