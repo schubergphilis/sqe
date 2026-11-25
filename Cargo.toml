@@ -94,7 +94,7 @@ geo = { version = "0.33", default-features = false }
 geo-traits = "0.3"
 geo-types = "0.7"
 wkb = "0.9"
-wkt = "0.14"
+wkt = "0.15"
 object_store = { version = "0.13", features = ["aws", "http", "azure", "gcp"] }
 
 # Iceberg — apache/iceberg-rust main @ 119fad92c, with RisingWave
