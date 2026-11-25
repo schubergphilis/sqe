@@ -269,7 +269,7 @@ chrono-tz = "0.10"
 # Cron expression parsing/evaluation for the maintenance scheduler's
 # `schedule` config (`crates/sqe-coordinator/src/maintenance_scheduler.rs`).
 # MIT-licensed, chrono-native, actively maintained.
-croner = "4"
+croner = "5"
 # Regex for Trino regexp_extract/extract_all/split
 regex = "1"
 futures = "0.3"

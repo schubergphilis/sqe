@@ -1696,13 +1696,13 @@ dependencies = [
 
 [[package]]
 name = "croner"
-version = "4.0.3"
+version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0097e28936e948e8f759478e1b5ec2e5ca70ab62cf38aaa9bd3aa660023e3fca"
+checksum = "5c0d18af839fad650d1673db4e2e40cfad3288dcb84a13670a9014e8d0978008"
 dependencies = [
  "chrono",
- "derive_builder",
- "strum",
+ "jiff 1.0.3",
+ "serde",
 ]
 
 [[package]]
@@ -4099,8 +4099,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ac703058abac89e5c39b0b879dce2b6b14a4ba36600c7e7e3d0c60a6883ef3c"
 dependencies = [
  "defmt",
- "jiff-core",
- "jiff-static",
+ "jiff-core 0.1.2",
+ "jiff-static 0.2.39",
  "jiff-tzdb-platform",
  "js-sys",
  "log",
@@ -4109,6 +4109,20 @@ dependencies = [
  "serde_core",
  "wasm-bindgen",
  "windows-link",
+]
+
+[[package]]
+name = "jiff"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "107f2e89536b6818514025f6787b0d94d819e54fe3b40365275fc753de485b3f"
+dependencies = [
+ "jiff-core 1.0.2",
+ "jiff-static 1.0.3",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
 ]
 
 [[package]]
@@ -4122,15 +4136,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "jiff-core"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d44c923edf2bf456a982253f1a9ee1f6e89e421dffd0065d9b9a581da0def58f"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "jiff-static"
 version = "0.2.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dc32470c67eb7d0e9ccb74303fa925313dc04cecb1aa048beaa6f391e36a93d"
 dependencies = [
- "jiff-core",
+ "jiff-core 0.1.2",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "jiff-static"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4996f71e569e3a3e32b925c28ef8f0027dc30bb1d594b33eeda409eea185f5c8"
+dependencies = [
+ "jiff-core 1.0.2",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -4886,7 +4921,7 @@ dependencies = [
  "bytes",
  "futures",
  "http",
- "jiff",
+ "jiff 0.2.39",
  "log",
  "md-5 0.11.0",
  "percent-encoding",
@@ -6092,7 +6127,7 @@ dependencies = [
  "hex",
  "hmac",
  "http",
- "jiff",
+ "jiff 0.2.39",
  "log",
  "percent-encoding",
  "sha1 0.11.0",
@@ -6671,7 +6706,7 @@ dependencies = [
  "hex",
  "indexmap 1.9.3",
  "indexmap 2.14.2",
- "jiff",
+ "jiff 0.2.39",
  "schemars 0.9.0",
  "schemars 1.2.3",
  "serde_core",
