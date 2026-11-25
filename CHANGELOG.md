@@ -4,6 +4,17 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+## [0.59.1] — 2026-11-25
+
+### Fixed
+
+- `sqe-geo` builds against `wkt` 0.15
+
+    `wkt` 0.15 changed `Wkt::from_str` to return `wkt::ParseError` instead of
+    `&str`, which broke `main` after the Renovate bump. The WKT parser now lets
+    the error type be inferred, and the message still reads
+    `<function>: invalid WKT: <reason>`.
+
 ## [0.59.0] — 2026-11-24
 
 ### Added
