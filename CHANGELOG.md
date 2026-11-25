@@ -4,6 +4,144 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+## [0.59.0] — 2026-11-24
+
+### Added
+
+- `approx_distinct` accepts `double` and `real` columns, as Trino does
+
+    It failed with "Support for 'approx_distinct' for data type Float64 is not implemented". Every NaN counts as one value, and `-0.0` and `0.0` count as one; NULL is not counted.
+
+- Columns can inherit their catalog's tags (#924)
+
+    With `[policy] inherit_catalog_tags = true` (env `SQE_POLICY__INHERIT_CATALOG_TAGS`) a tag mask or tag row filter on a catalog tag covers every column of every table in the catalog, including tables created later. A column's effective tags are its own, then its table's, its schema's and its catalog's; the nearest key wins. The flag is independent of `inherit_schema_tags`. SQE reads `sqe.catalog-tags` from the Polaris catalog with the caller's token on each table load, so a change applies from the next statement. A catalog whose tags cannot be read refuses reads of its tables: with the flag on, every principal that reads tables in the catalog needs `CATALOG_READ_PROPERTIES` on it in Polaris, and without it reads are refused, not unmasked. Off by default. Catalog tags are enforced by SQE only: they are not projected to Ranger, so Spark does not see them, and a catalog attached with `ATTACH` carries none.
+
+- Engine reads for discovered warehouses (`[query] discovery_engine_read`, off by default)
+
+    With `"template"`, a warehouse found by `catalog_discovery = "polaris-auto"`
+    reads with the template catalog's engine `credentials` once SQE has proved
+    it: the name is on `discovery_engine_warehouses` (exact names and `*`
+    patterns), it is not a configured catalog, warehouse alias, Hive root,
+    `system` or `datafusion`, and the person's and the engine's
+    `GET /v1/config?warehouse=` calls at the template URL both succeed with the
+    same `overrides.prefix`. Any refusal keeps the person's delegated keys.
+    Each proof writes a `discovery_engine_proof` audit event, and key fetches
+    on a proved warehouse are marked `discovered_engine_key_fetch`. Startup
+    refuses the setting without polaris-auto, template `client_credentials`
+    with `require_vended_credentials`, Ranger with `catalog_scoped`, and a
+    non-empty allowlist. Ranger then denies `select` by default on every
+    catalog except configured ones without engine credentials, Hive roots from
+    the config file, `datafusion`, `information_schema` and the reserved
+    `system` schemas. Writes, maintenance and DDL keep the person's delegated
+    keys in both modes.
+
+- `sqe-server` logs a startup warning when `[storage]` holds no static S3 key and `allow_all_object_stores` or `object_store_admin_roles` is set: those reads run on the pod role or instance profile, past the prefix allowlist
+
+    The book's Kubernetes page has a recipe for keyless S3 reads on EKS (EKS Pod Identity or IRSA), with the IAM, vended-credential and instance-metadata settings that keep the pod role narrow. The server build now fails to compile if it loses the AWS SDK credential chain.
+
+- OpenLineage event for ALTER TABLE ... RENAME TO
+
+    A rename now emits a run whose output is the new table name, with `lifecycleStateChange` set to `RENAME` and the old name in the facet's `previousIdentifier` (`namespace`, `name`). A bare new name stays in the old table's schema. The event is recorded before the rename runs, so a failed rename's FAIL event names the table too. The facet field is optional and left out for every other change, so existing event shapes are unchanged.
+
+- OpenLineage events for CREATE VIEW and DROP VIEW
+
+    CREATE VIEW now names the view as its output, with `lifecycleStateChange` `CREATE` (or `OVERWRITE` for CREATE OR REPLACE VIEW), the tables the view body reads as inputs, and the body's schema and column lineage. DROP VIEW names the view with `lifecycleStateChange` `DROP` and no inputs. Both carry the standard OpenLineage dataset facet `datasetType: {"datasetType": "VIEW"}`. The audit record of a CREATE VIEW now also lists the tables its body reads.
+
+- Catalog `client_credentials` blocks accept `client_secret_file`, read on every token request, so a rotated engine secret takes effect without a restart (#937)
+
+    The token cache is keyed on a fingerprint of the secret, and the first token on a new engine secret is audited as `engine_secret_rotated`. Startup refuses a block with both sources set or with an unreadable or empty file.
+
+### Changed
+
+- CI: the Trino wire test job also runs on main when `.gitlab-ci.yml` changes
+
+    The main-branch rule only matched Rust changes, so a CI-only merge never ran the job on main.
+
+- Design proposal for CTAS with a staged create, so a failed CTAS leaves no catalog entry (OpenSpec `ctas-staged-create`)
+
+    Design only; no behaviour change.
+
+- Design proposal for engine-keyed reads of discovered catalogs (OpenSpec `discovered-catalog-engine-read`)
+
+    Design only; no behaviour change.
+
+- OpenLineage event for a CTAS IF NOT EXISTS on an existing table
+
+    A `CREATE TABLE IF NOT EXISTS ... AS` that finds the table already there used to send a COMPLETE event with no datasets. It now names the table as the one output, carrying the custom dataset facet `sqe_skipped: {"reason": "table_exists"}`, with no `lifecycleStateChange`, no inputs and no column lineage. Events for every other statement are unchanged.
+
+- A failed CTAS names the table when its rollback cannot remove the catalog entry
+
+    The rollback drops the new entry as the caller. When the drop is refused, the statement's error now says that the entry for that table stays registered with no data. The client and the failed query's audit event (`message`) both carry it; before, only the coordinator log did. The error code is unchanged.
+
+- DDL lineage hint builders live in `sqe-lineage`
+
+    `lineage_scope`, `lineage_table`, `lineage_lifecycle_hint` and `lineage_rename_hint` moved from the coordinator's query handler to `sqe_lineage::ddl`, unchanged apart from their visibility and the rename hint taking the old and new names. Lineage events are unchanged.
+
+- Test-stack checks of engine reads on discovered warehouses
+
+    `catalog_discovery_test.rs` gains five live tests on Polaris. Each test creates its own principals and warehouses. A person with metadata access only reads a discovered warehouse through the engine, and fails with the opt-in off. A warehouse created during the run is readable with no restart. An INSERT stays on the person's delegation even when the engine may write. A signed catalog scope refuses a warehouse outside it before any proof call. The docs now say that the `/v1/config` proof shows both calls reach the same catalog, not that the engine holds a grant. The engine principal needs a catalog role on every allowlisted warehouse. Without one, reads fail with `ENGINE_CREDENTIALS_FAILED` and do not fall back to the person's keys. `bootstrap-test.sh` creates a `warehouse-engine` bucket. Tests and docs only; no engine change.
+
+- Load-level tests for engine reads on discovered warehouses
+
+    `tests/it/discovery_engine_load.rs` loads a table through a discovered warehouse against a mock catalog and checks the requests. A proved warehouse loads with the engine's keys: no `X-Iceberg-Access-Delegation` header, one `/credentials` call with the engine token, and the configured OAuth scope sent unchanged. An engine 403, a different engine prefix or a warehouse outside `discovery_engine_warehouses` loads with the person's delegated keys and makes no `/credentials` call. Two proved warehouses share one engine token, and a warehouse outside the session's catalog scope makes no call. Tests only; no engine change.
+
+- The access-control live suite asserts each `policy.mask_precedence` mode
+
+    `make test-access-control` can now run under `SQE_POLICY__MASK_PRECEDENCE=tag`, `resource` or `refuse`, so the `refuse` mode a deployment ships is tested end to end rather than only the default. `tag_mask_beats_resource_mask_live` checks the outcome of the mode it runs under: the tag mask wins under `tag`, the resource mask under `resource`, and the read is refused under `refuse`. `refuse_at_write_mask_conflict` uses an explicit `tag` handler for its `tag` step, so it no longer depends on the suite's mode. Tests only; no engine change.
+
+- Tests pin the SHOW TAGS columns and the tag and policy refusal texts
+
+    The SHOW TAGS schema (`column`, `tag`, `value`, `applied`, in that order) and the refusal phrases clients match (`mask conflict on ...: more than one distinct column mask`, `row filter conflict on ...: more than one distinct row filter`, `tag change refused: it would create a ... conflict`, `requires apply_tag`, `requires remove_tag`, `tag_removal = "admin"`) are now asserted in full, so changing one fails a test instead of breaking a client. Tests only; no output change.
+
+- The main branch pipeline runs the Trino wire golden tests (`sqe-trino-compat-wire`)
+
+    Main ran no test jobs, so a merge that broke the Trino HTTP protocol goldens (`crates/sqe-trino-compat/tests/wire.rs`) stayed green on main and surfaced only in later, unrelated MRs. The new job runs `cargo test -p sqe-trino-compat --test wire` on every main push that changes Rust sources, manifests, `Cargo.lock` or the toolchain, on the warm deps image. MR pipelines run it when `.gitlab-ci.yml` changes; otherwise the MR Rust test job already covers the test. Scheduled pipelines skip it.
+
+### Removed
+
+- Expired `reputation-unresolved` waiver for `ctutils` dropped from `.asset`
+
+    The waiver covered ctutils 0.4.5 while deps.dev had not yet indexed it. It
+    expired on 2026-11-06 and only produced a warning. `Cargo.lock` now pins
+    ctutils 0.4.8, which deps.dev resolves, and the dependency reputation check
+    reports no unresolved package without the waiver.
+
+### Fixed
+
+- Catalog scope claims are checked as the run gateway checks them (#908)
+
+    A scope's `iss` must be one string equal to `[session.catalog_scope] issuer`; an array that contains the issuer, which the JWT library accepted, is refused. A trailing `/` in the configured `issuer` is ignored, and `token_type = "JWT"` refuses startup, since it names no scope format. Scopes without `iat`, `nbf`, `aud` or a `typ` header are read as before.
+
+- UPDATE, DELETE and MERGE into a named catalog with engine credentials no longer fail as "engine-keyed" (#934)
+
+    A `[catalogs.<name>]` entry with `credentials` reads with engine-fetched keys. The write path built that catalog the same way as SELECT, so UPDATE, DELETE and MERGE (dbt incremental models among them) loaded their target with the engine's read keys, and the write check refused every one of them, also for a person allowed to write. The write path now builds such a catalog on the person's delegated keys, as it already did for the legacy `[catalog]` block. INSERT and CTAS were not affected. Covered by a mock-catalog test.
+
+- Lineage: column lineage through a view names the view body's base columns
+
+    A view's body is optimized before it is inlined, so its scans read a subset of the table's columns. The column tracer named the table's full schema by position and reported the wrong columns, for example `total <- items.id, items.label` instead of `items.amount, orders.qty`.
+
+- A statement over its own memory limit fails as `EXCEEDED_QUERY_MEMORY_LIMIT`, not `RESOURCE_EXHAUSTED` (#933)
+
+    A statement that alone needs more than `query.max_query_memory` now carries its own error name (Trino `errorType` `INSUFFICIENT_RESOURCES`, code 65538) over the Trino HTTP endpoint and Flight SQL. Flight answers `FAILED_PRECONDITION` instead of `RESOURCE_EXHAUSTED`, which clients retry, and the Trino endpoint sends no `Retry-After`. Load refusals keep `RESOURCE_EXHAUSTED`: a shared pool full of other statements, the pressure-admission quota, the queue, S3 throttling and the `SQE_<REASON>` admission refusals. A result buffer over the cap, a sort-on-write gate refusal and a Hive insert over the cap use the new name too. The `max_result_rows` and spill-cap refusals are unchanged.
+
+- Several tag masks on one column now join to the most restrictive one under `mask_precedence = "tag"` and `"resource"`, instead of the first tag in stored order winning (#942)
+
+    A steward holding only `apply_tag` could add a second tag with a weaker mask that sorted first and loosen the column. The masks of all the column's tags are now joined, whatever the tag order: `MASK_NULL` beats every other mask, a redaction beats the rest, and partial masks join to one that shows the fewest characters at each end and hides the character class unless they all agree (Ranger `MASK` plus `MASK_SHOW_LAST_4` shows nothing). Masks that cannot be joined (a hash next to a partial mask, two different CUSTOM masks) are a mask conflict: the column is restricted and reads fail with `mask conflict on <table>.<column>`. Columns that already carry two such tag masks therefore refuse reads after upgrade under `tag` and `resource` precedence until one tag is removed. The tag write that would create the conflict is refused. Resource-versus-tag resolution under `tag` precedence is unchanged: the tags' winning mask replaces the resource mask.
+
+- The write check before the first write into a table with no snapshot asks for the same rights as the write itself
+
+    It used to send a removal of the absent `main` ref, which a catalog authorizes as removing a snapshot ref. A grant that confers appending and setting refs but not removing them was refused on its first CTAS or INSERT. The check now sends what a first append sends (`add-snapshot` and `set-snapshot-ref` of `main`) under the same requirement that can never match, so nothing is committed.
+
+### Security
+
+- A catalog's configured `static` token and `client_credentials` secret are redacted in `Debug` output
+
+    They were plain strings, so formatting a catalog config with `{:?}` printed them in clear; nothing logged it today (#944).
+
+- A tag write under `tag_authority = "ranger-delegate"` needs USE on the schema first (#941)
+
+    Before the tag privilege is checked, a non-admin writing column, table or schema tags (`SET / UNSET TAGS`, `SET / UNSET MASKING POLICY`, a `sqe.column-tags` write through `SET TBLPROPERTIES` or `CREATE ... TBLPROPERTIES`, `ALTER TABLE | SCHEMA ... SET TAGS`) must hold a Ranger `select` (or `all`) allow on some table of that schema, with no `select` deny on the whole schema. `apply_tag`, `remove_tag` or `alter` alone no longer suffice, and a Ranger error refuses. A raw `sqe.column-tags` write asks again under the table's commit lock, so a `select` deny added after the check still refuses. With `[policy.ranger] catalog-scoped = true` the schema key carries the catalog, so the check covers it; otherwise Polaris decides the catalog when the write loads the table. Catalog tags and `admin-role` are unchanged, and admins pass. Upgrade note: a steward granted only `apply_tag` (or `alter`) with no `select` in the schema is now refused with `requires select (USE) on schema <ns>`; grant them `select` on a table there.
+
 ## [0.58.0] — 2026-11-23
 
 ### Added
