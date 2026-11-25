@@ -705,7 +705,7 @@ fn downcast<T: Array + Clone + 'static>(a: &ArrayRef) -> Result<T> {
 fn from_wkt(name: &str, text: &str) -> Result<Geometry> {
     let invalid =
         |e: &dyn std::fmt::Display| DataFusionError::Execution(format!("{name}: invalid WKT: {e}"));
-    let wkt: wkt::Wkt<f64> = text.parse().map_err(|e: &str| invalid(&e))?;
+    let wkt = text.parse::<wkt::Wkt<f64>>().map_err(|e| invalid(&e))?;
     if matches!(&wkt, wkt::Wkt::Point(p) if p.coord().is_none()) {
         return exec_err!("{name}: an empty POINT is not supported");
     }
